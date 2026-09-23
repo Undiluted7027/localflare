@@ -7,6 +7,8 @@ import { ZoneStore, normalizeZoneName, type SettingId, type ZoneType } from "./z
 import { RulesetStore, InvalidRuleset } from "./rulesets.js";
 import { DNSStore, InvalidDNSRecord } from "./dns.js";
 import { acknowledgePurge, InvalidCachePurge } from "./cache.js";
+import { R2Store, validBucketName } from "./r2.js";
+import { handleS3 } from "./s3.js";
 
 export const account = {
   id: "00000000000000000000000000000001",
@@ -531,6 +533,56 @@ async function handleDNS(request: IncomingMessage, response: ServerResponse, dns
   } else reply(response, 404, null);
 }
 
+async function handleR2(request: IncomingMessage, response: ServerResponse, r2: R2Store, route: string, url: URL) {
+  const method = request.method;
+  if (route === "buckets") {
+    if (method === "POST") {
+      const body = await readJson(request);
+      if (typeof body !== "object" || body === null || !("name" in body) || typeof body.name !== "string" ||
+          !validBucketName(body.name)) {
+        throw new InvalidWorkerUpload("Invalid R2 bucket name");
+      }
+      if (r2.has(body.name)) {
+        reply(response, 409, null, { code: 10073, message: "R2 bucket already exists" });
+        return;
+      }
+      if (("locationHint" in body && body.locationHint !== undefined) ||
+          ("storageClass" in body && body.storageClass !== undefined && body.storageClass !== "Standard")) {
+        throw new InvalidWorkerUpload("R2 location hints and nonstandard storage classes are not supported");
+      }
+      reply(response, 200, await r2.create(body.name));
+      return;
+    }
+    if (method === "GET") {
+      const perPage = Number(url.searchParams.get("per_page") ?? 100);
+      if (!Number.isInteger(perPage) || perPage < 1 || perPage > 1000) {
+        throw new InvalidWorkerUpload("Invalid R2 pagination");
+      }
+      let buckets = r2.list().filter((bucket) =>
+        !url.searchParams.has("name_contains") || bucket.name.includes(url.searchParams.get("name_contains")!));
+      if (url.searchParams.get("direction") === "desc") buckets.reverse();
+      const after = url.searchParams.get("cursor") ?? url.searchParams.get("start_after");
+      if (after) buckets = buckets.filter((bucket) =>
+        url.searchParams.get("direction") === "desc" ? bucket.name < after : bucket.name > after);
+      const result = buckets.slice(0, perPage);
+      reply(response, 200, { buckets: result }, buckets.length > perPage ? {
+        resultInfo: { cursor: result.at(-1)?.name, per_page: perPage },
+      } : undefined);
+      return;
+    }
+  }
+  const bucketName = /^buckets\/([^/]+)$/.exec(route)?.[1];
+  if (!bucketName) { reply(response, 404, null); return; }
+  const bucket = r2.get(bucketName);
+  if (!bucket) { reply(response, 404, null, { code: 10006, message: "R2 bucket not found" }); return; }
+  if (method === "GET") reply(response, 200, bucket);
+  else if (method === "DELETE") {
+    const result = await r2.delete(bucketName);
+    if (result === "not-empty") reply(response, 409, null, { code: 10008, message: "R2 bucket is not empty" });
+    else reply(response, 200, {});
+  } else reply(response, 404, null);
+}
+
 function sendScript(response: ServerResponse, content: string) {
   response.writeHead(200, { "content-type": "application/javascript; charset=utf-8" });
   response.end(content);
@@ -573,7 +625,7 @@ async function dispatchWorker(request: IncomingMessage, response: ServerResponse
 }
 
 async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore,
-  d1: D1Store, zones: ZoneStore, rulesets: RulesetStore, dns: DNSStore) {
+  d1: D1Store, zones: ZoneStore, rulesets: RulesetStore, dns: DNSStore, r2: R2Store) {
   const url = new URL(request.url ?? "/", "http://localhost");
   const { pathname } = url;
   const method = request.method;
@@ -581,6 +633,11 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
   const localWorker = /^\/__localflare\/workers\/([^/]+)(\/.*)?$/.exec(pathname);
   if (localWorker) {
     await dispatchWorker(request, response, workers, zones, rulesets, localWorker[1]!, `${localWorker[2] ?? "/"}${url.search}`);
+    return;
+  }
+
+  if (!pathname.startsWith("/client/v4")) {
+    await handleS3(request, response, url, r2);
     return;
   }
 
@@ -673,6 +730,10 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
   }
   if (route.startsWith("d1/")) {
     await handleD1(request, response, d1, route.slice("d1/".length), url);
+    return;
+  }
+  if (route.startsWith("r2/")) {
+    await handleR2(request, response, r2, route.slice("r2/".length), url);
     return;
   }
   if (!route.startsWith("workers/")) {
@@ -781,9 +842,10 @@ export function createLocalflareServer() {
   const zones = new ZoneStore(account);
   const rulesets = new RulesetStore();
   const dns = new DNSStore();
-  const workers = new WorkerStore(kv, d1);
+  const r2 = new R2Store();
+  const workers = new WorkerStore(kv, d1, r2);
   const server = createServer((request, response) => {
-    void handle(request, response, workers, kv, d1, zones, rulesets, dns).catch((error: unknown) => {
+    void handle(request, response, workers, kv, d1, zones, rulesets, dns, r2).catch((error: unknown) => {
       if (error instanceof InvalidWorkerUpload || error instanceof InvalidRuleset ||
           error instanceof InvalidDNSRecord || error instanceof InvalidCachePurge) {
         reply(response, 400, null, { code: 10021, message: error.message });
@@ -793,6 +855,6 @@ export function createLocalflareServer() {
       }
     });
   });
-  server.on("close", () => { void Promise.all([workers.dispose(), kv.dispose(), d1.dispose()]).catch(console.error); });
+  server.on("close", () => { void Promise.all([workers.dispose(), kv.dispose(), d1.dispose(), r2.dispose()]).catch(console.error); });
   return server;
 }

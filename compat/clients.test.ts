@@ -8,6 +8,9 @@ import { after, before, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest } from "node:http";
 import Cloudflare from "cloudflare";
+import { S3Client, ListBucketsCommand, CreateBucketCommand, DeleteBucketCommand,
+  PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command,
+  DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { account, createLocalflareServer } from "../src/server.js";
 
 const run = promisify(execFile);
@@ -239,6 +242,77 @@ test("real Wrangler D1 create and execute share SQLite data with a deployed Work
   }
   await client.d1.database.delete(database.uuid, { account_id: account.id });
   assert.ok(!(await client.d1.database.list({ account_id: account.id })).result.some((item) => item.uuid === database.uuid));
+});
+
+test("real Wrangler, S3 SDK, and Worker share a Miniflare-backed R2 bucket", async () => {
+  const bucket = "compat-r2-bucket";
+  const wrangler = resolve("node_modules/.bin/wrangler");
+  const env = {
+    ...process.env,
+    CLOUDFLARE_API_BASE_URL: baseURL,
+    CLOUDFLARE_API_TOKEN: "localflare-fake-token",
+    CLOUDFLARE_ACCOUNT_ID: account.id,
+    WRANGLER_SEND_METRICS: "false",
+  };
+  const s3 = new S3Client({
+    endpoint: baseURL.replace("/client/v4", ""), region: "auto", forcePathStyle: true,
+    credentials: { accessKeyId: "localflare", secretAccessKey: "localflare" },
+  });
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const created = await run(wrangler, ["r2", "bucket", "create", bucket], { env, timeout: 30_000 });
+  assert.match(created.stdout, /compat-r2-bucket/);
+  assert.equal((await client.r2.buckets.get(bucket, { account_id: account.id })).name, bucket);
+  assert.ok((await s3.send(new ListBucketsCommand({}))).Buckets?.some((item) => item.Name === bucket));
+
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket, Key: "folder/example.txt", Body: "from S3", ContentType: "text/plain",
+  }));
+  const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: "folder/example.txt" }));
+  assert.equal(head.ContentLength, 7);
+  assert.equal(head.ContentType, "text/plain");
+  const listed = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: "folder/" }));
+  assert.deepEqual(listed.Contents?.map((item) => item.Key), ["folder/example.txt"]);
+
+  const directory = await mkdtemp(join(tmpdir(), "localflare-r2-worker-"));
+  try {
+    await writeFile(join(directory, "wrangler.jsonc"), JSON.stringify({
+      name: "r2-reader",
+      main: resolve("compat/workers/r2.js"),
+      compatibility_date: "2025-07-18",
+      r2_buckets: [{ binding: "BUCKET", bucket_name: bucket }],
+    }));
+    const deployed = await run(wrangler, [
+      "deploy", "--config", join(directory, "wrangler.jsonc"), "--no-autoconfig",
+    ], { env, timeout: 30_000 });
+    assert.match(deployed.stdout, /Deployed r2-reader triggers/);
+    const invocationURL = `${baseURL.replace("/client/v4", "")}/__localflare/workers/r2-reader/`;
+    assert.equal(await (await fetch(invocationURL)).text(), "from S3");
+    assert.equal(await (await fetch(invocationURL, { method: "POST", body: "from Worker" })).text(), "stored");
+    const workerObject = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: "from-worker" }));
+    assert.equal(await workerObject.Body?.transformToString(), "from Worker");
+    await client.workers.scripts.delete("r2-reader", { account_id: account.id });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+
+  const object = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: "folder/example.txt" }));
+  assert.equal(await object.Body?.transformToString(), "from S3");
+  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: "folder/example.txt" }));
+  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: "from-worker" }));
+  await client.r2.buckets.delete(bucket, { account_id: account.id });
+  assert.ok(!(await client.r2.buckets.list({ account_id: account.id })).buckets?.some((item) => item.name === bucket));
+});
+
+test("real S3 SDK creates and deletes an R2 bucket", async () => {
+  const bucket = "s3-created-bucket";
+  const s3 = new S3Client({
+    endpoint: baseURL.replace("/client/v4", ""), region: "auto", forcePathStyle: true,
+    credentials: { accessKeyId: "localflare", secretAccessKey: "localflare" },
+  });
+  await s3.send(new CreateBucketCommand({ Bucket: bucket }));
+  assert.ok((await s3.send(new ListBucketsCommand({}))).Buckets?.some((item) => item.Name === bucket));
+  await s3.send(new DeleteBucketCommand({ Bucket: bucket }));
+  assert.ok(!(await s3.send(new ListBucketsCommand({}))).Buckets?.some((item) => item.Name === bucket));
 });
 
 test("official TypeScript SDK verifies a fake token and lists the local account", async () => {

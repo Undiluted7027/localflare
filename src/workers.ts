@@ -6,13 +6,14 @@ import { randomUUID } from "node:crypto";
 import { Miniflare } from "miniflare";
 import { KVStore } from "./kv.js";
 import { D1Store } from "./d1.js";
+import { R2Store } from "./r2.js";
 
 interface WorkerMetadata {
   main_module?: string;
   body_part?: string;
   compatibility_date?: string;
   compatibility_flags?: string[];
-  bindings?: Array<{ type: string; name: string; text?: string; class_name?: string; script_name?: string; namespace_id?: string; id?: string }>;
+  bindings?: Array<{ type: string; name: string; text?: string; class_name?: string; script_name?: string; namespace_id?: string; id?: string; bucket_name?: string }>;
   migrations?: { old_tag?: string; new_tag: string; steps: Array<{ new_sqlite_classes: string[] }> };
 }
 
@@ -84,11 +85,12 @@ function filenameFromMetadata(metadata: WorkerMetadata): string {
   return filename;
 }
 
-function runtimeBindings(metadata: WorkerMetadata, kv: KVStore, d1: D1Store) {
+function runtimeBindings(metadata: WorkerMetadata, kv: KVStore, d1: D1Store, r2: R2Store) {
   const bindings: Record<string, string> = {};
   const durableObjects: Record<string, string> = {};
   const kvNamespaces: Record<string, string> = {};
   const d1Databases: Record<string, string> = {};
+  const r2Buckets: Record<string, string> = {};
   for (const binding of metadata.bindings ?? []) {
     if (typeof binding !== "object" || binding === null || typeof binding.name !== "string") {
       throw new InvalidWorkerUpload("Invalid binding");
@@ -111,11 +113,16 @@ function runtimeBindings(metadata: WorkerMetadata, kv: KVStore, d1: D1Store) {
         throw new InvalidWorkerUpload("D1 binding needs an existing database id");
       }
       d1Databases[binding.name] = binding.id;
+    } else if (binding.type === "r2_bucket") {
+      if (typeof binding.bucket_name !== "string" || !r2.has(binding.bucket_name)) {
+        throw new InvalidWorkerUpload("R2 binding needs an existing bucket_name");
+      }
+      r2Buckets[binding.name] = r2.namespace(binding.bucket_name)!;
     } else {
       throw new InvalidWorkerUpload(`Unsupported binding type: ${binding.type}`);
     }
   }
-  return { bindings, durableObjects, kvNamespaces, d1Databases };
+  return { bindings, durableObjects, kvNamespaces, d1Databases, r2Buckets };
 }
 
 /** Owns uploaded scripts and their workerd instances for one Localflare server. */
@@ -123,7 +130,7 @@ export class WorkerStore {
   private readonly scripts = new Map<string, StoredWorker>();
   private readonly durableObjectRoot = mkdtempSync(join(tmpdir(), "localflare-do-"));
 
-  constructor(private readonly kv: KVStore, private readonly d1: D1Store) {}
+  constructor(private readonly kv: KVStore, private readonly d1: D1Store, private readonly r2: R2Store) {}
 
   get(name: string) {
     return this.scripts.get(name);
@@ -151,12 +158,13 @@ export class WorkerStore {
 
     try {
       await writeFile(join(directory, filename), content);
-      const bindings = runtimeBindings(metadata, this.kv, this.d1);
+      const bindings = runtimeBindings(metadata, this.kv, this.d1, this.r2);
       const common = {
         modulesRoot: directory,
         ...bindings,
         kvPersist: this.kv.persistPath,
         d1Persist: this.d1.persistPath,
+        r2Persist: this.r2.persistPath,
         durableObjectsPersist: Object.keys(bindings.durableObjects).length > 0
           ? join(this.durableObjectRoot, encodeURIComponent(name))
           : undefined,
