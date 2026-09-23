@@ -62,7 +62,7 @@ function publicZone(zone: Zone) {
   return result;
 }
 
-/** Zone IDs become the parent identity for Rulesets and DNS in later checkpoints. */
+/** Zone IDs are the parent identity for Rulesets and DNS records. */
 export class ZoneStore {
   private readonly zones = new Map<string, Zone>();
 

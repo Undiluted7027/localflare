@@ -5,6 +5,8 @@ import { KVStore } from "./kv.js";
 import { D1Store, type D1Query, type SqlParam } from "./d1.js";
 import { ZoneStore, normalizeZoneName, type SettingId, type ZoneType } from "./zones.js";
 import { RulesetStore, InvalidRuleset } from "./rulesets.js";
+import { DNSStore, InvalidDNSRecord } from "./dns.js";
+import { acknowledgePurge, InvalidCachePurge } from "./cache.js";
 
 export const account = {
   id: "00000000000000000000000000000001",
@@ -477,6 +479,58 @@ async function handleZones(request: IncomingMessage, response: ServerResponse, z
   } else reply(response, 404, null);
 }
 
+async function handleDNS(request: IncomingMessage, response: ServerResponse, dns: DNSStore,
+  zoneId: string, zoneName: string, recordId: string | undefined, url: URL) {
+  const method = request.method;
+  if (!recordId) {
+    if (method === "POST") {
+      reply(response, 200, dns.create(zoneId, zoneName, await readJson(request)));
+      return;
+    }
+    if (method === "GET") {
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const perPage = Number(url.searchParams.get("per_page") ?? 100);
+      if (!Number.isInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > 5000) {
+        throw new InvalidDNSRecord("Invalid DNS pagination");
+      }
+      const name = url.searchParams.get("name.exact") ?? url.searchParams.get("name[exact]") ?? url.searchParams.get("name");
+      const content = url.searchParams.get("content.exact") ?? url.searchParams.get("content[exact]") ?? url.searchParams.get("content");
+      let records = dns.list(zoneId).filter((record) =>
+        (!name || record.name === name.toLowerCase()) &&
+        (!content || record.content === content) &&
+        (!url.searchParams.has("type") || record.type === url.searchParams.get("type")) &&
+        (!url.searchParams.has("proxied") || String(record.proxied) === url.searchParams.get("proxied")));
+      const order = url.searchParams.get("order") ?? "name";
+      if (!(["type", "name", "content", "ttl", "proxied"] as string[]).includes(order)) {
+        throw new InvalidDNSRecord("Invalid DNS sort order");
+      }
+      records.sort((a, b) => String(a[order as keyof typeof a]).localeCompare(String(b[order as keyof typeof b])));
+      if (url.searchParams.get("direction") === "desc") records.reverse();
+      const total = records.length;
+      records = records.slice((page - 1) * perPage, page * perPage);
+      reply(response, 200, records, { resultInfo: {
+        page, per_page: perPage, count: records.length, total_count: total,
+        total_pages: Math.ceil(total / perPage),
+      } });
+      return;
+    }
+    reply(response, 404, null);
+    return;
+  }
+  const existing = dns.get(zoneId, recordId);
+  if (!existing) {
+    reply(response, 404, null, { code: 81044, message: "DNS record not found" });
+    return;
+  }
+  if (method === "GET") reply(response, 200, existing);
+  else if (method === "PUT" || method === "PATCH") {
+    reply(response, 200, dns.update(zoneId, zoneName, recordId, await readJson(request), method === "PUT"));
+  } else if (method === "DELETE") {
+    dns.delete(zoneId, recordId);
+    reply(response, 200, { id: recordId });
+  } else reply(response, 404, null);
+}
+
 function sendScript(response: ServerResponse, content: string) {
   response.writeHead(200, { "content-type": "application/javascript; charset=utf-8" });
   response.end(content);
@@ -519,7 +573,7 @@ async function dispatchWorker(request: IncomingMessage, response: ServerResponse
 }
 
 async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore,
-  d1: D1Store, zones: ZoneStore, rulesets: RulesetStore) {
+  d1: D1Store, zones: ZoneStore, rulesets: RulesetStore, dns: DNSStore) {
   const url = new URL(request.url ?? "/", "http://localhost");
   const { pathname } = url;
   const method = request.method;
@@ -578,10 +632,30 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
     return;
   }
 
+  const dnsPath = /^\/client\/v4\/zones\/([^/]+)\/dns_records(?:\/([^/]+))?$/.exec(pathname);
+  if (dnsPath) {
+    const zoneId = dnsPath[1]!;
+    const zone = zones.get(zoneId);
+    if (!zone) reply(response, 404, null, { code: 9109, message: "Zone not found" });
+    else await handleDNS(request, response, dns, zoneId, zone.name, dnsPath[2], url);
+    return;
+  }
+
+  const purgePath = /^\/client\/v4\/zones\/([^/]+)\/purge_cache$/.exec(pathname);
+  if (purgePath) {
+    if (!zones.get(purgePath[1]!)) reply(response, 404, null, { code: 9109, message: "Zone not found" });
+    else if (method === "POST") reply(response, 200, acknowledgePurge(await readJson(request)));
+    else reply(response, 404, null);
+    return;
+  }
+
   if (pathname === "/client/v4/zones" || pathname.startsWith("/client/v4/zones/")) {
     if (method === "DELETE") {
       const zoneId = /^\/client\/v4\/zones\/([^/]+)$/.exec(pathname)?.[1];
-      if (zoneId) rulesets.deleteZone(zoneId);
+      if (zoneId) {
+        rulesets.deleteZone(zoneId);
+        dns.deleteZone(zoneId);
+      }
     }
     await handleZones(request, response, zones, url);
     return;
@@ -706,10 +780,12 @@ export function createLocalflareServer() {
   const d1 = new D1Store();
   const zones = new ZoneStore(account);
   const rulesets = new RulesetStore();
+  const dns = new DNSStore();
   const workers = new WorkerStore(kv, d1);
   const server = createServer((request, response) => {
-    void handle(request, response, workers, kv, d1, zones, rulesets).catch((error: unknown) => {
-      if (error instanceof InvalidWorkerUpload || error instanceof InvalidRuleset) {
+    void handle(request, response, workers, kv, d1, zones, rulesets, dns).catch((error: unknown) => {
+      if (error instanceof InvalidWorkerUpload || error instanceof InvalidRuleset ||
+          error instanceof InvalidDNSRecord || error instanceof InvalidCachePurge) {
         reply(response, 400, null, { code: 10021, message: error.message });
       } else {
         console.error(error);

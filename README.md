@@ -1,6 +1,6 @@
 # Localflare
 
-Localflare is becoming a headless local Cloudflare API emulator. **Checkpoints 1–6 are implemented.** Real clients can reach its identity API, deploy a Worker, and manage KV, D1, zones, and rulesets without a Cloudflare account.
+Localflare is becoming a headless local Cloudflare API emulator. **Checkpoints 1–7 are implemented.** Real clients can reach its identity API, deploy a Worker, and manage KV, D1, zones, rulesets, and DNS without a Cloudflare account.
 
 ## Run
 
@@ -88,7 +88,11 @@ curl -H 'Host: example.test' http://127.0.0.1:8788/__localflare/workers/hello/ex
 
 Account rulesets, phase entry point convenience routes, individual rule and version routes, dynamic redirect/rewrite expressions, custom ruleset execution, and broader Rules language fields are not yet implemented. Custom rulesets can be stored, but only zone entry point rulesets affect local requests. Rule evaluation is limited to the local Worker invocation path; Localflare does not route arbitrary zone traffic or activate DNS.
 
-The account identity is fixed for now. Worker scripts, Durable Object state, KV state, D1 databases, zones, and rulesets are held for the life of the server and removed when it stops. Request bodies are limited to 10 MiB. Text and secret text bindings, local Durable Object bindings, KV and D1 bindings, and initial `new_sqlite_classes` migrations are supported. Durable Object rename, delete, transfer, and cross Worker bindings are not implemented. Other services belong to later checkpoints in [POC.md](./POC.md).
+Checkpoint 7 serves DNS record create/list/get/update/delete at `/zones/:zone_id/dns_records` and accepts cache purge requests at `/zones/:zone_id/purge_cache`. A, AAAA, CNAME, TXT, and MX records are stored in memory with name and TTL validation; CNAME conflicts are rejected. The official TypeScript SDK and a real Terraform `cloudflare_dns_record` resource are verified against these routes. Localflare does not run an authoritative DNS server or resolve these records for Worker traffic.
+
+The purge endpoint accepts purge everything, URL files, tags, hosts, or prefixes and returns the documented request ID. Localflare has no CDN cache store, so it acknowledges a valid purge without evicting content. Purge calls do not clear Worker Cache API entries in Miniflare.
+
+The account identity is fixed for now. Worker scripts, Durable Object state, KV state, D1 databases, zones, rulesets, and DNS records are held for the life of the server and removed when it stops. Request bodies are limited to 10 MiB. Text and secret text bindings, local Durable Object bindings, KV and D1 bindings, and initial `new_sqlite_classes` migrations are supported. Durable Object rename, delete, transfer, and cross Worker bindings are not implemented. Other services belong to later checkpoints in [POC.md](./POC.md).
 
 ## Verify
 
@@ -98,7 +102,7 @@ npm test
 npm run test:compat
 ```
 
-The compatibility suite launches the pinned Wrangler binary, uses the official `cloudflare` TypeScript SDK, and runs Terraform with the real Cloudflare provider. It deploys and redeploys Workers, checks Durable Object state across redeploy, runs Wrangler KV and D1 commands, verifies SDK operations, proves deployed Workers share KV and D1 state with the management API, and applies then destroys Terraform zones and a ruleset. Terraform must be installed separately. `terraform init` downloads the pinned provider when it is not cached. The suite starts Localflare on an ephemeral loopback port and supplies that port through each client's base URL override.
+The compatibility suite launches the pinned Wrangler binary, uses the official `cloudflare` TypeScript SDK, and runs Terraform with the real Cloudflare provider. It deploys and redeploys Workers, checks Durable Object state across redeploy, runs Wrangler KV and D1 commands, verifies SDK operations, proves deployed Workers share KV and D1 state with the management API, and applies then destroys Terraform zones, a ruleset, and a DNS record. Terraform must be installed separately. `terraform init` downloads the pinned provider when it is not cached. The suite starts Localflare on an ephemeral loopback port and supplies that port through each client's base URL override.
 
 The Terraform fixture uses a synthetic 40 character token because the provider checks token format before making HTTP requests. No real credential is used.
 

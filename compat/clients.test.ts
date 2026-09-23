@@ -318,6 +318,44 @@ test("official TypeScript SDK manages a zone URL rewrite ruleset", async () => {
   }
 });
 
+test("official TypeScript SDK manages DNS records and submits cache purges", async () => {
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const zone = await client.zones.create({
+    account: { id: account.id }, name: "sdk-dns.example", type: "full",
+  });
+  try {
+    const created = await client.dns.records.create({
+      zone_id: zone.id, type: "A", name: "www.sdk-dns.example",
+      content: "192.0.2.10", ttl: 1, proxied: true, comment: "SDK record",
+    });
+    assert.equal(created.name, "www.sdk-dns.example");
+    assert.equal(created.content, "192.0.2.10");
+    assert.equal(created.proxied, true);
+    const listed = await client.dns.records.list({ zone_id: zone.id, type: "A", name: { exact: created.name } });
+    assert.deepEqual(listed.result.map((record) => record.id), [created.id]);
+    assert.equal((await client.dns.records.get(created.id, { zone_id: zone.id })).content, "192.0.2.10");
+    const edited = await client.dns.records.edit(created.id, {
+      zone_id: zone.id, type: "A", name: created.name,
+      content: "192.0.2.11", ttl: 1, proxied: true,
+    });
+    assert.equal(edited.content, "192.0.2.11");
+    const replaced = await client.dns.records.update(created.id, {
+      zone_id: zone.id, type: "A", name: created.name,
+      content: "192.0.2.12", ttl: 1, proxied: true,
+    });
+    assert.equal(replaced.content, "192.0.2.12");
+
+    assert.match((await client.cache.purge({ zone_id: zone.id, purge_everything: true }))?.id ?? "", /^[a-f0-9]{32}$/);
+    assert.match((await client.cache.purge({
+      zone_id: zone.id, files: ["https://www.sdk-dns.example/example.css"],
+    }))?.id ?? "", /^[a-f0-9]{32}$/);
+    assert.deepEqual(await client.dns.records.delete(created.id, { zone_id: zone.id }), { id: created.id });
+    assert.equal((await client.dns.records.list({ zone_id: zone.id })).result.length, 0);
+  } finally {
+    await client.zones.delete({ zone_id: zone.id });
+  }
+});
+
 test("real Terraform provider reads accounts through base_url", async () => {
   const directory = await mkdtemp(join(tmpdir(), "localflare-terraform-"));
   try {
@@ -402,6 +440,35 @@ test("real Terraform provider applies and updates a zone firewall ruleset", asyn
       cwd: directory, env, timeout: 60_000,
     });
     assert.equal(await invoke("/second"), 404);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("real Terraform provider applies and updates a DNS record", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "localflare-terraform-dns-"));
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const env = { ...process.env, TF_IN_AUTOMATION: "1", TF_INPUT: "0" };
+  const fixture = await readFile(new URL("./terraform/dns.tf", import.meta.url), "utf8");
+  const mainPath = join(directory, "main.tf");
+  try {
+    await writeFile(mainPath, fixture.replaceAll("LOCALFLARE_BASE_URL", baseURL).replace("FINAL_OCTET", "20"));
+    await run("terraform", ["init", "-no-color"], { cwd: directory, env, timeout: 180_000 });
+    const apply = () => run("terraform", ["apply", "-auto-approve", "-no-color"], {
+      cwd: directory, env, timeout: 60_000,
+    });
+    await apply();
+    const zoneId = (await run("terraform", ["output", "-raw", "zone_id"], { cwd: directory, env })).stdout.trim();
+    const recordId = (await run("terraform", ["output", "-raw", "dns_record_id"], { cwd: directory, env })).stdout.trim();
+    assert.match(recordId, /^[a-f0-9]{32}$/);
+    assert.equal((await client.dns.records.get(recordId, { zone_id: zoneId })).content, "192.0.2.20");
+    await writeFile(mainPath, fixture.replaceAll("LOCALFLARE_BASE_URL", baseURL).replace("FINAL_OCTET", "21"));
+    await apply();
+    assert.equal((await client.dns.records.get(recordId, { zone_id: zoneId })).content, "192.0.2.21");
+    await run("terraform", ["destroy", "-auto-approve", "-no-color"], {
+      cwd: directory, env, timeout: 60_000,
+    });
+    assert.ok(!(await client.zones.list({ name: "terraform-dns.example" })).result.some((zone) => zone.id === zoneId));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
