@@ -1,3 +1,5 @@
+<!-- this is a test -->
+
 # Localflare — the floci of Cloudflare
 
 The idea is to make a free, headless, wire-compatible local Cloudflare emulator, in the spirit of [floci](https://github.com/floci-io/floci) for AWS.
