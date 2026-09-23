@@ -65,6 +65,8 @@ Mirroring floci's "Supported Services" table — status is honest about what's r
 | Zones (create/list, zone settings) | — | Not yet built; needed as the account/zone identity every other endpoint hangs off of |
 | DNS records | — | Not yet built |
 | Cache purge | — | Not yet built |
+| Zone origin (reverse proxy to a dev's real local app) | — | Not yet built — see checkpoint 10 |
+| Workers Routes + edge entrypoint (real hostname-based dispatch, DNS resolution to Localflare) | — | Not yet built — see checkpoint 11 |
 | Access / Zero Trust, Images, Stream, Workers AI, Vectorize, Analytics Engine, Pages | — | Out of scope for now — large, identity-heavy, or low-value for a local dev loop. Revisit after the core surface above is solid, the same way floci grew from S3/DynamoDB/Lambda outward rather than starting broad. |
 
 ## Architecture (target)
@@ -86,6 +88,26 @@ Wrangler / Terraform / Cloudflare SDK / curl
 
 One process, one port (floci uses `4566`; Localflare needs its own memorable, unclaimed port — pick this deliberately in checkpoint 1, don't default to Cloudflare's own `443`). Everything under it is either a real Cloudflare-authored runtime component (workerd) or an in-process store, same as floci's stateless/stateful service split.
 
+### Data plane (target, checkpoints 10–11)
+
+Everything above is the *management* plane — real tools configuring Localflare through `client/v4`. It proves the config is accepted; it doesn't prove the config does anything to a real request. A second, thinner path closes that gap: a dev's actual app, hit by real HTTP traffic, experiencing the zone's rulesets/DNS/routing exactly like it would behind real Cloudflare.
+
+```
+Browser / curl / a dev's real app
+        |  real hostname, e.g. https://myapp.localhost
+        v
+  Edge entrypoint  (real listener, checkpoint 11)
+        |  resolve Host header -> zone (same matching dispatchWorker already does)
+        v
+  Ruleset evaluation  (existing per-zone rule-engine, unchanged)
+        |
+        +--> Host matches a Workers Route  --> dispatch to that zone's Worker (workerd/Miniflare)
+        +--> no Route match, zone has an origin --> reverse proxy to the zone's configured origin (checkpoint 10)
+        +--> no Route match, no origin --> 404, same as an unconfigured real CF zone
+```
+
+DNS resolution for this path doesn't need a real DNS server: a `proxied: true` DNS record gets an entry synced into `/etc/hosts` pointing that hostname at `127.0.0.1` (the technique [portless](https://github.com/vercel-labs/portless) uses for its `.localhost`/custom-TLD routing) — unproxied (`proxied: false`) records get no entry, so they resolve to whatever they'd really resolve to, matching Cloudflare's real grey-cloud "DNS only" behavior of bypassing the proxy entirely. Like the rest of Localflare, this listener binds loopback-only (`127.0.0.1`/`::1`), never LAN, by default.
+
 ## Checkpoints
 
 Rebuilt around API-surface breadth, not demo narrative. Each checkpoint should leave something a real tool can already talk to.
@@ -101,8 +123,12 @@ Rebuilt around API-surface breadth, not demo narrative. Each checkpoint should l
 | 7 | DNS records + cache purge | Rounds out the zone-scoped surface most IaC workflows also touch, alongside checkpoint 6 |
 | 8 | R2 bucket + object CRUD via the S3-compatible surface | Proves the "reuse an existing protocol" bet pays off |
 | 9 | Queues management API (create/list/delete queue, consumers); `wrangler queues create` succeeds locally | Last of the "Supported services" table's real-but-unbuilt rows |
+| 10 | Per-zone `origin` config (a URL a dev's real local app runs at) plus a reverse proxy that forwards to it after ruleset evaluation; verify with `curl -H "Host: <zone>"` against the proxy port and a real local app, no DNS/`/etc/hosts` involved yet | A zone becomes useful with zero Workers deployed to it — matches how most real Cloudflare zones work (origin + edge policy, not 100% Workers), and proves ruleset phases (redirect/transform/firewall) apply to proxied traffic, not just to `dispatchWorker`'s synthetic path |
+| 11 | Workers Routes API (`/zones/:id/workers/routes`, hostname pattern → script) plus a real listener that generalizes today's `dispatchWorker` Host-matching off `/__localflare/workers/:name/*`; `proxied` DNS records (checkpoint 7) get synced into `/etc/hosts` so real hostnames resolve to Localflare locally, no synthetic path required | Closes the data-plane gap: a dev's actual app or browser, pointed at a real hostname, experiences DNS + Rulesets + Workers Routes + origin proxying (checkpoint 10) exactly as configured — the "connect your stuff and see how your CF config impacts it" story, for real traffic instead of only for `client/v4` calls |
 
 Durable Objects deliberately has no checkpoint of its own: unlike KV/D1/R2/Queues, Cloudflare's DO management surface beyond Workers script deploy config (namespace bindings, migrations) is thin, so it rides along with checkpoint 2's Workers script CRUD rather than needing standalone endpoints. Revisit if that turns out to be wrong once checkpoint 2 is underway.
+
+Checkpoints 10 and 11 are split deliberately: 10 (origin + proxy) is fully testable with an explicit `Host` header and needs no OS-level changes, so it can be verified in isolation before 11 adds the riskier, machine-state-touching piece (`/etc/hosts` sync, binding a real listener port). Do 10 first; don't let 11's OS-level complexity block proving the ruleset-on-proxied-traffic behavior.
 
 Treat this as an ordered backlog, not a calendar — same caveat the old POC.md carried, still true.
 
