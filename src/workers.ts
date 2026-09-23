@@ -4,13 +4,14 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Miniflare } from "miniflare";
+import { KVStore } from "./kv.js";
 
 interface WorkerMetadata {
   main_module?: string;
   body_part?: string;
   compatibility_date?: string;
   compatibility_flags?: string[];
-  bindings?: Array<{ type: string; name: string; text?: string; class_name?: string; script_name?: string }>;
+  bindings?: Array<{ type: string; name: string; text?: string; class_name?: string; script_name?: string; namespace_id?: string }>;
   migrations?: { old_tag?: string; new_tag: string; steps: Array<{ new_sqlite_classes: string[] }> };
 }
 
@@ -82,9 +83,10 @@ function filenameFromMetadata(metadata: WorkerMetadata): string {
   return filename;
 }
 
-function runtimeBindings(metadata: WorkerMetadata) {
+function runtimeBindings(metadata: WorkerMetadata, kv: KVStore) {
   const bindings: Record<string, string> = {};
   const durableObjects: Record<string, string> = {};
+  const kvNamespaces: Record<string, string> = {};
   for (const binding of metadata.bindings ?? []) {
     if (typeof binding !== "object" || binding === null || typeof binding.name !== "string") {
       throw new InvalidWorkerUpload("Invalid binding");
@@ -97,17 +99,24 @@ function runtimeBindings(metadata: WorkerMetadata) {
         throw new InvalidWorkerUpload("Durable Object binding needs a local class_name");
       }
       durableObjects[binding.name] = binding.class_name;
+    } else if (binding.type === "kv_namespace") {
+      if (typeof binding.namespace_id !== "string" || !kv.has(binding.namespace_id)) {
+        throw new InvalidWorkerUpload("KV binding needs an existing namespace_id");
+      }
+      kvNamespaces[binding.name] = binding.namespace_id;
     } else {
       throw new InvalidWorkerUpload(`Unsupported binding type: ${binding.type}`);
     }
   }
-  return { bindings, durableObjects };
+  return { bindings, durableObjects, kvNamespaces };
 }
 
 /** Owns uploaded scripts and their workerd instances for one Localflare server. */
 export class WorkerStore {
   private readonly scripts = new Map<string, StoredWorker>();
   private readonly durableObjectRoot = mkdtempSync(join(tmpdir(), "localflare-do-"));
+
+  constructor(private readonly kv: KVStore) {}
 
   get(name: string) {
     return this.scripts.get(name);
@@ -135,10 +144,11 @@ export class WorkerStore {
 
     try {
       await writeFile(join(directory, filename), content);
-      const bindings = runtimeBindings(metadata);
+      const bindings = runtimeBindings(metadata, this.kv);
       const common = {
         modulesRoot: directory,
         ...bindings,
+        kvPersist: this.kv.persistPath,
         durableObjectsPersist: Object.keys(bindings.durableObjects).length > 0
           ? join(this.durableObjectRoot, encodeURIComponent(name))
           : undefined,

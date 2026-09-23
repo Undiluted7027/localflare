@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { WorkerStore, InvalidWorkerUpload } from "./workers.js";
+import { KVStore } from "./kv.js";
 
 export const account = {
   id: "00000000000000000000000000000001",
@@ -102,6 +103,156 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   }
 }
 
+function titleFromBody(body: unknown) {
+  if (typeof body !== "object" || body === null || !("title" in body) ||
+      typeof body.title !== "string" || body.title.length === 0 || body.title.length > 512) {
+    throw new InvalidWorkerUpload("Namespace title must be 1–512 characters");
+  }
+  return body.title;
+}
+
+async function handleKV(request: IncomingMessage, response: ServerResponse, kv: KVStore, route: string, url: URL) {
+  const method = request.method;
+  if (route === "namespaces") {
+    if (method === "POST") {
+      const title = titleFromBody(await readJson(request));
+      const created = await kv.create(title);
+      if (!created) {
+        reply(response, 400, null, { code: 10021, message: "Namespace title already exists" });
+        return;
+      }
+      reply(response, 200, created);
+      return;
+    }
+    if (method === "GET") {
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const perPage = Number(url.searchParams.get("per_page") ?? 20);
+      if (!Number.isInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > 1000) {
+        throw new InvalidWorkerUpload("Invalid namespace pagination");
+      }
+      const namespaces = kv.list().sort((a, b) => a.title.localeCompare(b.title));
+      const result = namespaces.slice((page - 1) * perPage, page * perPage);
+      reply(response, 200, result, { resultInfo: {
+        page, per_page: perPage, count: result.length,
+        total_count: namespaces.length, total_pages: Math.ceil(namespaces.length / perPage),
+      } });
+      return;
+    }
+  }
+
+  const match = /^namespaces\/([^/]+)(?:\/(.*))?$/.exec(route);
+  if (!match) {
+    reply(response, 404, null);
+    return;
+  }
+  const id = match[1]!;
+  const suffix = match[2];
+  const namespace = kv.get(id);
+  if (!namespace) {
+    reply(response, 404, null, { code: 10013, message: "KV namespace not found" });
+    return;
+  }
+  if (suffix === undefined) {
+    if (method === "GET") reply(response, 200, namespace);
+    else if (method === "PUT") {
+      const title = titleFromBody(await readJson(request));
+      if (kv.hasTitle(title, id)) reply(response, 400, null, { code: 10021, message: "Namespace title already exists" });
+      else reply(response, 200, kv.rename(id, title));
+    } else if (method === "DELETE") {
+      await kv.delete(id);
+      reply(response, 200, {});
+    } else reply(response, 404, null);
+    return;
+  }
+
+  const binding = await kv.binding(id);
+  if (!binding) throw new Error("KV namespace has no Miniflare binding");
+  if (suffix === "keys" && method === "GET") {
+    const limit = Number(url.searchParams.get("limit") ?? 1000);
+    if (!Number.isInteger(limit) || limit < 10 || limit > 1000) throw new InvalidWorkerUpload("Invalid key list limit");
+    const listed = await binding.list({
+      prefix: url.searchParams.get("prefix") ?? undefined,
+      cursor: url.searchParams.get("cursor") ?? undefined,
+      limit,
+    });
+    reply(response, 200, listed.keys, { resultInfo: { count: listed.keys.length, cursor: listed.cursor ?? "" } });
+    return;
+  }
+  if (!suffix.startsWith("values/")) {
+    reply(response, 404, null);
+    return;
+  }
+  let key: string;
+  try {
+    key = decodeURIComponent(suffix.slice("values/".length));
+  } catch {
+    throw new InvalidWorkerUpload("Invalid key encoding");
+  }
+  if (!key || Buffer.byteLength(key) > 512) throw new InvalidWorkerUpload("KV key must be 1–512 bytes");
+  if (method === "PUT") {
+    const contentType = request.headers["content-type"] ?? "";
+    let value: Uint8Array = await readBody(request);
+    let metadata: unknown;
+    if (contentType.startsWith("multipart/form-data")) {
+      const formRequest = new Request("http://localflare.invalid", {
+        method: "POST", headers: { "content-type": contentType }, body: new Uint8Array(value),
+      });
+      const form = await formRequest.formData();
+      const field = form.get("value");
+      if (field === null) throw new InvalidWorkerUpload("Missing KV value");
+      value = typeof field === "string" ? Buffer.from(field) : new Uint8Array(await field.arrayBuffer());
+      const rawMetadata = form.get("metadata");
+      if (rawMetadata !== null) {
+        if (typeof rawMetadata !== "string") throw new InvalidWorkerUpload("Invalid KV metadata");
+        try { metadata = JSON.parse(rawMetadata) as unknown; }
+        catch { throw new InvalidWorkerUpload("Invalid KV metadata JSON"); }
+      } else {
+        const fields = [...form].filter(([name]) => name.startsWith("metadata["));
+        if (fields.length > 0) {
+          const object: Record<string, string> = {};
+          for (const [name, entry] of fields) {
+            const fieldName = /^metadata\[([^\]]+)\]$/.exec(name)?.[1];
+            if (!fieldName || typeof entry !== "string") throw new InvalidWorkerUpload("Invalid KV metadata field");
+            object[fieldName] = entry;
+          }
+          metadata = object;
+        }
+      }
+    }
+    const expiration = url.searchParams.get("expiration");
+    const expirationTtl = url.searchParams.get("expiration_ttl");
+    if (expiration !== null && (!Number.isInteger(Number(expiration)) || Number(expiration) <= 0)) {
+      throw new InvalidWorkerUpload("Invalid expiration");
+    }
+    if (expirationTtl !== null && (!Number.isInteger(Number(expirationTtl)) || Number(expirationTtl) < 60)) {
+      throw new InvalidWorkerUpload("expiration_ttl must be at least 60 seconds");
+    }
+    await binding.put(key, new Uint8Array(value).buffer, {
+      expiration: expiration === null ? undefined : Number(expiration),
+      expirationTtl: expirationTtl === null ? undefined : Number(expirationTtl),
+      metadata,
+    });
+    reply(response, 200, null);
+    return;
+  }
+  if (method === "GET") {
+    const value = await binding.get(key, "arrayBuffer");
+    if (value === null) {
+      reply(response, 404, null, { code: 10009, message: "KV key not found" });
+    } else {
+      response.writeHead(200, { "content-type": "application/octet-stream" });
+      response.end(Buffer.from(value));
+    }
+    return;
+  }
+  if (method === "DELETE") {
+    await binding.delete(key);
+    reply(response, 200, null);
+    return;
+  }
+  reply(response, 404, null);
+}
+
 function sendScript(response: ServerResponse, content: string) {
   response.writeHead(200, { "content-type": "application/javascript; charset=utf-8" });
   response.end(content);
@@ -125,7 +276,7 @@ async function dispatchWorker(request: IncomingMessage, response: ServerResponse
   response.end(Buffer.from(await workerResponse.arrayBuffer()));
 }
 
-async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore) {
+async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore) {
   const url = new URL(request.url ?? "/", "http://localhost");
   const { pathname } = url;
   const method = request.method;
@@ -158,29 +309,38 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
     }
   }
 
-  const accountPath = /^\/client\/v4\/accounts\/([^/]+)\/workers\/(.*)$/.exec(pathname);
+  const accountPath = /^\/client\/v4\/accounts\/([^/]+)\/(.*)$/.exec(pathname);
   if (!accountPath || accountPath[1] !== account.id) {
     reply(response, 404, null);
     return;
   }
   const route = accountPath[2]!;
-  if (method === "GET" && route === "subdomain") {
+  if (route.startsWith("storage/kv/")) {
+    await handleKV(request, response, kv, route.slice("storage/kv/".length), url);
+    return;
+  }
+  if (!route.startsWith("workers/")) {
+    reply(response, 404, null);
+    return;
+  }
+  const workerRoute = route.slice("workers/".length);
+  if (method === "GET" && workerRoute === "subdomain") {
     reply(response, 200, { subdomain: "localflare" });
     return;
   }
-  if (method === "GET" && route === "scripts") {
+  if (method === "GET" && workerRoute === "scripts") {
     reply(response, 200, workers.list());
     return;
   }
-  if (method === "GET" && /^workers\/[^/]+$/.test(route)) {
-    const worker = workers.get(route.slice("workers/".length));
+  if (method === "GET" && /^workers\/[^/]+$/.test(workerRoute)) {
+    const worker = workers.get(workerRoute.slice("workers/".length));
     if (worker) reply(response, 200, { subdomain: worker.subdomain, previews_base_config: {} });
     else reply(response, 404, null, { code: 10007, message: "Worker not found" });
     return;
   }
 
-  const scriptPath = /^scripts\/([^/]+)(?:\/(.*))?$/.exec(route);
-  const servicePath = /^services\/([^/]+)$/.exec(route);
+  const scriptPath = /^scripts\/([^/]+)(?:\/(.*))?$/.exec(workerRoute);
+  const servicePath = /^services\/([^/]+)$/.exec(workerRoute);
   if (servicePath && method === "GET") {
     const worker = workers.get(servicePath[1]!);
     if (worker) {
@@ -260,9 +420,10 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
 }
 
 export function createLocalflareServer() {
-  const workers = new WorkerStore();
+  const kv = new KVStore();
+  const workers = new WorkerStore(kv);
   const server = createServer((request, response) => {
-    void handle(request, response, workers).catch((error: unknown) => {
+    void handle(request, response, workers, kv).catch((error: unknown) => {
       if (error instanceof InvalidWorkerUpload) {
         reply(response, 400, null, { code: 10021, message: error.message });
       } else {
@@ -271,6 +432,6 @@ export function createLocalflareServer() {
       }
     });
   });
-  server.on("close", () => { void workers.dispose().catch(console.error); });
+  server.on("close", () => { void Promise.all([workers.dispose(), kv.dispose()]).catch(console.error); });
   return server;
 }

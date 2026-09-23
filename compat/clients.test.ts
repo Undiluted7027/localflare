@@ -106,6 +106,79 @@ test("real Wrangler deploys a Durable Object and keeps its state on redeploy", a
   assert.equal(await (await fetch(invokeURL)).text(), "3");
 });
 
+test("real Wrangler and SDK manage a KV namespace shared with a deployed Worker", async () => {
+  const wrangler = resolve("node_modules/.bin/wrangler");
+  const env = {
+    ...process.env,
+    CLOUDFLARE_API_BASE_URL: baseURL,
+    CLOUDFLARE_API_TOKEN: "localflare-fake-token",
+    CLOUDFLARE_ACCOUNT_ID: account.id,
+    WRANGLER_SEND_METRICS: "false",
+  };
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const created = await run(wrangler, ["kv", "namespace", "create", "compat-kv", "--update-config=false"], {
+    env, timeout: 30_000,
+  });
+  assert.match(created.stdout, /compat-kv/);
+  const page = await client.kv.namespaces.list({ account_id: account.id });
+  const namespace = page.result.find((item) => item.title === "compat-kv");
+  assert.ok(namespace);
+
+  const put = await run(wrangler, [
+    "kv", "key", "put", "shared/key", "from Wrangler", "--namespace-id", namespace.id, "--remote",
+  ], { env, timeout: 30_000 });
+  assert.match(put.stdout, /Writing the value "from Wrangler"/);
+  const read = () => run(wrangler, [
+    "kv", "key", "get", "shared/key", "--namespace-id", namespace.id, "--remote",
+  ], { env, timeout: 30_000 });
+  assert.equal((await read()).stdout.trim(), "from Wrangler");
+
+  const directory = await mkdtemp(join(tmpdir(), "localflare-kv-worker-"));
+  try {
+    await writeFile(join(directory, "wrangler.jsonc"), JSON.stringify({
+      name: "kv-reader",
+      main: resolve("compat/workers/kv.js"),
+      compatibility_date: "2025-07-18",
+      kv_namespaces: [{ binding: "KV", id: namespace.id }],
+    }));
+    const deployed = await run(wrangler, [
+      "deploy", "--config", join(directory, "wrangler.jsonc"), "--no-autoconfig",
+    ], { env, timeout: 30_000 });
+    assert.match(deployed.stdout, /Deployed kv-reader triggers/);
+    const invocationURL = `${baseURL.replace("/client/v4", "")}/__localflare/workers/kv-reader/`;
+    assert.equal(await (await fetch(invocationURL)).text(), "from Wrangler");
+    assert.equal(await (await fetch(invocationURL, { method: "POST" })).text(), "written by Worker");
+    assert.equal((await read()).stdout.trim(), "written by Worker");
+
+    const keys = await client.kv.namespaces.keys.list(namespace.id, { account_id: account.id });
+    assert.ok(keys.result.some((key) => key.name === "shared/key"));
+    const value = await client.kv.namespaces.values.get("shared/key", {
+      account_id: account.id, namespace_id: namespace.id,
+    });
+    assert.equal(await value.text(), "written by Worker");
+    await client.kv.namespaces.values.update("with-metadata", {
+      account_id: account.id,
+      namespace_id: namespace.id,
+      value: "SDK value",
+      metadata: { source: "sdk" },
+      expiration_ttl: 60,
+    });
+    const keysWithMetadata = await client.kv.namespaces.keys.list(namespace.id, { account_id: account.id });
+    const metadataKey = keysWithMetadata.result.find((key) => key.name === "with-metadata");
+    assert.deepEqual(metadataKey?.metadata, { source: "sdk" });
+    assert.ok(metadataKey?.expiration && metadataKey.expiration > Date.now() / 1000);
+    await client.kv.namespaces.values.delete("shared/key", {
+      account_id: account.id, namespace_id: namespace.id,
+    });
+    assert.equal((await (await fetch(invocationURL)).text()), "missing");
+    await client.workers.scripts.delete("kv-reader", { account_id: account.id });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+  await client.kv.namespaces.delete(namespace.id, { account_id: account.id });
+  assert.ok(!(await client.kv.namespaces.list({ account_id: account.id })).result.some((item) => item.id === namespace.id));
+});
+
 test("official TypeScript SDK verifies a fake token and lists the local account", async () => {
   const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
   const verification = await client.user.tokens.verify();
