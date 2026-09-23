@@ -1,9 +1,9 @@
-# Localflare — a tiny Cloudflare you can take apart
+# Localflare — the floci of Cloudflare
 
-The idea is to make an all-in-one local Cloudflare-like environment around your app.
-Think Workers, storage, HTTP rules, firewalls, and a programmable network, running together on your machine.
-Watch requests move through it, change rules, break connections, and see how your app behaves.
-Save the setup and replay experiments so other developers can reproduce what happened.
+The idea is to make a free, headless, wire-compatible local Cloudflare emulator, in the spirit of [floci](https://github.com/floci-io/floci) for AWS.
+Point `wrangler`, the Cloudflare Terraform provider, and the official Cloudflare SDKs at a local endpoint and have them work unmodified — no dashboard, no account, no auth token.
+Workers run on the real runtime (workerd via Miniflare); KV, D1, R2, Durable Objects, Queues, Rulesets, Zones, and DNS get built out service by service behind Cloudflare's actual `client/v4` wire shapes.
+See `POC.md` for the full plan and checkpoints.
 
 ## Important
 
