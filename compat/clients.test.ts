@@ -179,6 +179,67 @@ test("real Wrangler and SDK manage a KV namespace shared with a deployed Worker"
   assert.ok(!(await client.kv.namespaces.list({ account_id: account.id })).result.some((item) => item.id === namespace.id));
 });
 
+test("real Wrangler D1 create and execute share SQLite data with a deployed Worker", async () => {
+  const wrangler = resolve("node_modules/.bin/wrangler");
+  const env = {
+    ...process.env,
+    CLOUDFLARE_API_BASE_URL: baseURL,
+    CLOUDFLARE_API_TOKEN: "localflare-fake-token",
+    CLOUDFLARE_ACCOUNT_ID: account.id,
+    WRANGLER_SEND_METRICS: "false",
+  };
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const created = await run(wrangler, ["d1", "create", "compat-d1", "--update-config=false"], {
+    env, timeout: 30_000,
+  });
+  assert.match(created.stdout, /Successfully created DB 'compat-d1'/);
+  const page = await client.d1.database.list({ account_id: account.id });
+  const database = page.result.find((item) => item.name === "compat-d1");
+  assert.ok(database?.uuid);
+  const updated = await client.d1.database.update(database.uuid, {
+    account_id: account.id, read_replication: { mode: "disabled" },
+  });
+  assert.equal(updated.read_replication?.mode, "disabled");
+  assert.equal((await client.d1.database.get(database.uuid, { account_id: account.id })).name, "compat-d1");
+
+  const execute = (sql: string) => run(wrangler, [
+    "d1", "execute", "compat-d1", "--remote", "--command", sql, "--json",
+  ], { env, timeout: 30_000 });
+  const sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL); INSERT INTO notes (body) VALUES ('one; two'); SELECT body FROM notes ORDER BY id;";
+  const result: unknown = JSON.parse((await execute(sql)).stdout);
+  assert.ok(Array.isArray(result));
+  assert.deepEqual(result.at(-1)?.results, [{ body: "one; two" }]);
+
+  const directory = await mkdtemp(join(tmpdir(), "localflare-d1-worker-"));
+  try {
+    await writeFile(join(directory, "wrangler.jsonc"), JSON.stringify({
+      name: "d1-reader",
+      main: resolve("compat/workers/d1.js"),
+      compatibility_date: "2025-07-18",
+      d1_databases: [{ binding: "DB", database_name: "compat-d1", database_id: database.uuid }],
+    }));
+    const deployed = await run(wrangler, [
+      "deploy", "--config", join(directory, "wrangler.jsonc"), "--no-autoconfig",
+    ], { env, timeout: 30_000 });
+    assert.match(deployed.stdout, /Deployed d1-reader triggers/);
+    const invocationURL = `${baseURL.replace("/client/v4", "")}/__localflare/workers/d1-reader/`;
+    assert.deepEqual(await (await fetch(invocationURL)).json(), [{ body: "one; two" }]);
+    assert.deepEqual(await (await fetch(invocationURL, { method: "POST" })).json(), [
+      { body: "one; two" }, { body: "from Worker" },
+    ]);
+
+    const queried = await client.d1.database.query(database.uuid, {
+      account_id: account.id, sql: "SELECT body FROM notes WHERE body = ?", params: ["from Worker"],
+    });
+    assert.deepEqual(queried.result[0]?.results, [{ body: "from Worker" }]);
+    await client.workers.scripts.delete("d1-reader", { account_id: account.id });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+  await client.d1.database.delete(database.uuid, { account_id: account.id });
+  assert.ok(!(await client.d1.database.list({ account_id: account.id })).result.some((item) => item.uuid === database.uuid));
+});
+
 test("official TypeScript SDK verifies a fake token and lists the local account", async () => {
   const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
   const verification = await client.user.tokens.verify();

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import { account, createLocalflareServer } from "../src/server.js";
+import { splitSql } from "../src/d1.js";
 
 const server = createLocalflareServer();
 let baseURL: string;
@@ -114,4 +115,38 @@ test("KV namespaces reject duplicate titles and keep binary values distinct", as
   assert.equal(page.result_info.total_count, 1);
   assert.deepEqual(page.result, []);
   assert.equal((await fetch(`${namespacesURL}/${id}`, { method: "DELETE" })).status, 200);
+});
+
+test("D1 batches roll back on SQL errors and expose a useful API error", async () => {
+  const databasesURL = `${baseURL}/accounts/${account.id}/d1/database`;
+  const create = () => fetch(databasesURL, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "transaction-test" }),
+  });
+  const created = await create();
+  assert.equal(created.status, 200);
+  const uuid = (await created.json() as { result: { uuid: string } }).result.uuid;
+  const duplicate = await create();
+  assert.equal(duplicate.status, 400);
+  assert.equal((await duplicate.json() as { errors: Array<{ code: number }> }).errors[0]?.code, 7502);
+
+  const query = (sql: string) => fetch(`${databasesURL}/${uuid}/query`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sql }),
+  });
+  assert.equal((await query("CREATE TABLE entries (value TEXT NOT NULL)")).status, 200);
+  const failed = await query("INSERT INTO entries (value) VALUES ('keep?'); INSERT INTO absent (value) VALUES ('no')");
+  assert.equal(failed.status, 400);
+  assert.match(JSON.stringify(await failed.json()), /absent/);
+  const selected = await query("SELECT value FROM entries");
+  assert.equal(selected.status, 200);
+  assert.deepEqual((await selected.json() as { result: Array<{ results: unknown[] }> }).result[0]?.results, []);
+  assert.equal((await fetch(`${databasesURL}/${uuid}`, { method: "DELETE" })).status, 200);
+});
+
+test("D1 statement splitting preserves semicolons in strings and comments", () => {
+  assert.deepEqual(splitSql("SELECT ';' AS value; -- ignored ;\n SELECT [a;b] FROM t;"), [
+    "SELECT ';' AS value", "-- ignored ;\n SELECT [a;b] FROM t",
+  ]);
+  assert.deepEqual(splitSql("SELECT 1; -- trailing comment;\n /* more; comments */"), ["SELECT 1"]);
 });

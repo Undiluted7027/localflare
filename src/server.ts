@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { WorkerStore, InvalidWorkerUpload } from "./workers.js";
 import { KVStore } from "./kv.js";
+import { D1Store, type D1Query, type SqlParam } from "./d1.js";
 
 export const account = {
   id: "00000000000000000000000000000001",
@@ -253,6 +254,105 @@ async function handleKV(request: IncomingMessage, response: ServerResponse, kv: 
   reply(response, 404, null);
 }
 
+function parseD1Query(value: unknown): D1Query {
+  if (typeof value !== "object" || value === null || !("sql" in value) ||
+      typeof value.sql !== "string" || value.sql.trim().length === 0) {
+    throw new InvalidWorkerUpload("D1 query needs nonempty sql");
+  }
+  let params: SqlParam[] | undefined;
+  if ("params" in value && value.params !== undefined) {
+    if (!Array.isArray(value.params) || !value.params.every((param: unknown) =>
+      param === null || typeof param === "string" || typeof param === "number" || typeof param === "boolean")) {
+      throw new InvalidWorkerUpload("D1 params must be scalar values");
+    }
+    params = value.params as SqlParam[];
+  }
+  return { sql: value.sql, params };
+}
+
+function parseD1Queries(body: unknown) {
+  if (typeof body !== "object" || body === null) throw new InvalidWorkerUpload("Invalid D1 query body");
+  if ("batch" in body) {
+    if (!Array.isArray(body.batch) || body.batch.length === 0) throw new InvalidWorkerUpload("D1 batch cannot be empty");
+    return body.batch.map(parseD1Query);
+  }
+  return [parseD1Query(body)];
+}
+
+async function handleD1(request: IncomingMessage, response: ServerResponse, d1: D1Store, route: string, url: URL) {
+  const method = request.method;
+  if (route === "database") {
+    if (method === "POST") {
+      const body = await readJson(request);
+      if (typeof body !== "object" || body === null || !("name" in body) ||
+          typeof body.name !== "string" || body.name.length === 0) {
+        throw new InvalidWorkerUpload("D1 database needs a name");
+      }
+      const created = await d1.create(body.name);
+      if (created) reply(response, 200, created);
+      else reply(response, 400, null, { code: 7502, message: "A database with that name already exists" });
+      return;
+    }
+    if (method === "GET") {
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const perPage = Number(url.searchParams.get("per_page") ?? 10);
+      if (!Number.isInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > 1000) {
+        throw new InvalidWorkerUpload("Invalid D1 pagination");
+      }
+      const databases = d1.list()
+        .filter((database) => !url.searchParams.has("name") || database.name === url.searchParams.get("name"))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const result = databases.slice((page - 1) * perPage, page * perPage);
+      reply(response, 200, result, { resultInfo: {
+        page, per_page: perPage, count: result.length,
+        total_count: databases.length, total_pages: Math.ceil(databases.length / perPage),
+      } });
+      return;
+    }
+  }
+
+  const match = /^database\/([^/]+)(?:\/(.*))?$/.exec(route);
+  if (!match) {
+    reply(response, 404, null);
+    return;
+  }
+  const idOrName = decodeURIComponent(match[1]!);
+  const database = d1.get(idOrName);
+  if (!database) {
+    reply(response, 404, null, { code: 7404, message: "D1 database not found" });
+    return;
+  }
+  const suffix = match[2];
+  if (suffix === undefined) {
+    if (method === "GET") reply(response, 200, database);
+    else if (method === "DELETE") {
+      await d1.delete(database.uuid);
+      reply(response, 200, null);
+    } else if (method === "PUT" || method === "PATCH") {
+      const body = await readJson(request);
+      const replication = typeof body === "object" && body !== null && "read_replication" in body
+        ? body.read_replication : undefined;
+      const mode = typeof replication === "object" && replication !== null && "mode" in replication
+        ? replication.mode : undefined;
+      if (mode !== "auto" && mode !== "disabled") {
+        throw new InvalidWorkerUpload("D1 read_replication.mode must be auto or disabled");
+      }
+      reply(response, 200, d1.update(database.uuid, mode));
+    } else reply(response, 404, null);
+    return;
+  }
+  if (suffix === "query" && method === "POST") {
+    const queries = parseD1Queries(await readJson(request));
+    try {
+      reply(response, 200, await d1.query(database.uuid, queries));
+    } catch (error) {
+      reply(response, 400, null, { code: 7500, message: error instanceof Error ? error.message : "D1 query failed" });
+    }
+    return;
+  }
+  reply(response, 404, null);
+}
+
 function sendScript(response: ServerResponse, content: string) {
   response.writeHead(200, { "content-type": "application/javascript; charset=utf-8" });
   response.end(content);
@@ -276,7 +376,7 @@ async function dispatchWorker(request: IncomingMessage, response: ServerResponse
   response.end(Buffer.from(await workerResponse.arrayBuffer()));
 }
 
-async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore) {
+async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore, d1: D1Store) {
   const url = new URL(request.url ?? "/", "http://localhost");
   const { pathname } = url;
   const method = request.method;
@@ -317,6 +417,10 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
   const route = accountPath[2]!;
   if (route.startsWith("storage/kv/")) {
     await handleKV(request, response, kv, route.slice("storage/kv/".length), url);
+    return;
+  }
+  if (route.startsWith("d1/")) {
+    await handleD1(request, response, d1, route.slice("d1/".length), url);
     return;
   }
   if (!route.startsWith("workers/")) {
@@ -421,9 +525,10 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
 
 export function createLocalflareServer() {
   const kv = new KVStore();
-  const workers = new WorkerStore(kv);
+  const d1 = new D1Store();
+  const workers = new WorkerStore(kv, d1);
   const server = createServer((request, response) => {
-    void handle(request, response, workers, kv).catch((error: unknown) => {
+    void handle(request, response, workers, kv, d1).catch((error: unknown) => {
       if (error instanceof InvalidWorkerUpload) {
         reply(response, 400, null, { code: 10021, message: error.message });
       } else {
@@ -432,6 +537,6 @@ export function createLocalflareServer() {
       }
     });
   });
-  server.on("close", () => { void Promise.all([workers.dispose(), kv.dispose()]).catch(console.error); });
+  server.on("close", () => { void Promise.all([workers.dispose(), kv.dispose(), d1.dispose()]).catch(console.error); });
   return server;
 }
