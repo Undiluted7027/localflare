@@ -35,3 +35,33 @@ test("local identity works with or without a fake bearer token", async () => {
     result_info: { page: 1, per_page: 20, count: 1, total_count: 1, total_pages: 1 },
   });
 });
+
+test("an invalid replacement leaves the deployed Worker running", async () => {
+  const scriptURL = `${baseURL}/accounts/${account.id}/workers/scripts/atomic`;
+  const invokeURL = baseURL.replace("/client/v4", "/__localflare/workers/atomic/");
+  const upload = (source: string) => {
+    const form = new FormData();
+    form.set("metadata", JSON.stringify({ main_module: "worker.js" }));
+    form.set("worker.js", new File([source], "worker.js", { type: "application/javascript+module" }));
+    return fetch(scriptURL, { method: "PUT", body: form });
+  };
+
+  assert.equal((await upload("export default { fetch() { return new Response('working') } }")).status, 200);
+  assert.equal(await (await fetch(invokeURL)).text(), "working");
+  assert.equal((await upload("export default { fetch( { broken")).status, 400);
+  assert.equal(await (await fetch(invokeURL)).text(), "working");
+});
+
+test("service worker syntax runs through Miniflare", async () => {
+  const form = new FormData();
+  form.set("metadata", JSON.stringify({ body_part: "worker.js" }));
+  form.set("worker.js", new File([
+    "addEventListener('fetch', event => event.respondWith(new Response('classic worker')))",
+  ], "worker.js", { type: "application/javascript" }));
+  const uploaded = await fetch(`${baseURL}/accounts/${account.id}/workers/scripts/classic`, {
+    method: "PUT", body: form,
+  });
+  assert.equal(uploaded.status, 200);
+  const invocation = await fetch(baseURL.replace("/client/v4", "/__localflare/workers/classic/"));
+  assert.equal(await invocation.text(), "classic worker");
+});

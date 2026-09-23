@@ -32,13 +32,78 @@ test("real Wrangler whoami uses the local API and prints its account", async () 
       ...process.env,
       CLOUDFLARE_API_BASE_URL: baseURL,
       CLOUDFLARE_API_TOKEN: "localflare-fake-token",
-      CLOUDFLARE_SEND_METRICS: "false",
+      WRANGLER_SEND_METRICS: "false",
     },
     timeout: 30_000,
   });
   const output: unknown = JSON.parse(stdout);
   assert.ok(typeof output === "object" && output !== null && "accounts" in output);
   assert.deepEqual(output.accounts, [account]);
+});
+
+test("real Wrangler deploys and redeploys a Worker that runs in workerd", async () => {
+  const name = "compat-worker";
+  const wrangler = resolve("node_modules/.bin/wrangler");
+  const args = [
+    "deploy", resolve("compat/workers/hello.js"), "--name", name,
+    "--compatibility-date", "2025-07-18", "--no-autoconfig",
+  ];
+  const env = {
+    ...process.env,
+    CLOUDFLARE_API_BASE_URL: baseURL,
+    CLOUDFLARE_API_TOKEN: "localflare-fake-token",
+    CLOUDFLARE_ACCOUNT_ID: account.id,
+    WRANGLER_SEND_METRICS: "false",
+  };
+
+  const first = await run(wrangler, args, { env, timeout: 30_000 });
+  assert.match(first.stdout, /Deployed compat-worker triggers/);
+  const second = await run(wrangler, args, { env, timeout: 30_000 });
+  assert.match(second.stdout, /Deployed compat-worker triggers/);
+
+  const invocation = await fetch(`${baseURL.replace("/client/v4", "")}/__localflare/workers/${name}/hello`);
+  assert.equal(invocation.status, 200);
+  assert.equal(await invocation.text(), "Localflare Worker: /hello");
+
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const scripts = await client.workers.scripts.list({ account_id: account.id });
+  assert.ok(scripts.result.some((script) => script.id === name));
+  const content = await client.workers.scripts.get(name, { account_id: account.id });
+  assert.match(content, /Localflare Worker/);
+  await client.workers.scripts.update(name, {
+    account_id: account.id,
+    metadata: { main_module: "sdk.js" },
+    files: [new File([
+      "export default { fetch() { return new Response('updated by SDK') } }",
+    ], "sdk.js", { type: "application/javascript+module" })],
+  });
+  const updated = await fetch(`${baseURL.replace("/client/v4", "")}/__localflare/workers/${name}/hello`);
+  assert.equal(await updated.text(), "updated by SDK");
+  await client.workers.scripts.delete(name, { account_id: account.id });
+  const missing = await fetch(`${baseURL.replace("/client/v4", "")}/__localflare/workers/${name}/hello`);
+  assert.equal(missing.status, 404);
+});
+
+test("real Wrangler deploys a Durable Object and keeps its state on redeploy", async () => {
+  const wrangler = resolve("node_modules/.bin/wrangler");
+  const config = resolve("compat/workers/durable/wrangler.jsonc");
+  const env = {
+    ...process.env,
+    CLOUDFLARE_API_BASE_URL: baseURL,
+    CLOUDFLARE_API_TOKEN: "localflare-fake-token",
+    CLOUDFLARE_ACCOUNT_ID: account.id,
+    WRANGLER_SEND_METRICS: "false",
+  };
+  const deploy = () => run(wrangler, ["deploy", "--config", config, "--no-autoconfig"], {
+    env, timeout: 30_000,
+  });
+  const invokeURL = `${baseURL.replace("/client/v4", "")}/__localflare/workers/durable-counter/`;
+
+  assert.match((await deploy()).stdout, /Deployed durable-counter triggers/);
+  assert.equal(await (await fetch(invokeURL)).text(), "1");
+  assert.equal(await (await fetch(invokeURL)).text(), "2");
+  assert.match((await deploy()).stdout, /Deployed durable-counter triggers/);
+  assert.equal(await (await fetch(invokeURL)).text(), "3");
 });
 
 test("official TypeScript SDK verifies a fake token and lists the local account", async () => {

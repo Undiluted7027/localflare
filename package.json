@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "dependencies": {
+    "miniflare": "3.20250718.3"
+  },
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit",

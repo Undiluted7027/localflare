@@ -1,0 +1,9 @@
+{
+  "name": "durable-counter",
+  "main": "worker.js",
+  "compatibility_date": "2025-07-18",
+  "durable_objects": {
+    "bindings": [{ "name": "COUNTER", "class_name": "Counter" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }]
+}
