@@ -7,13 +7,14 @@ import { Miniflare } from "miniflare";
 import { KVStore } from "./kv.js";
 import { D1Store } from "./d1.js";
 import { R2Store } from "./r2.js";
+import { QueueStore } from "./queues.js";
 
 interface WorkerMetadata {
   main_module?: string;
   body_part?: string;
   compatibility_date?: string;
   compatibility_flags?: string[];
-  bindings?: Array<{ type: string; name: string; text?: string; class_name?: string; script_name?: string; namespace_id?: string; id?: string; bucket_name?: string }>;
+  bindings?: Array<{ type: string; name: string; text?: string; class_name?: string; script_name?: string; namespace_id?: string; id?: string; bucket_name?: string; queue_name?: string }>;
   migrations?: { old_tag?: string; new_tag: string; steps: Array<{ new_sqlite_classes: string[] }> };
 }
 
@@ -21,6 +22,8 @@ interface StoredWorker {
   content: string;
   directory: string;
   runtime: Miniflare;
+  options: ConstructorParameters<typeof Miniflare>[0];
+  producerQueues: string[];
   subdomain: { enabled: boolean; previews_enabled: boolean };
   script: {
     id: string;
@@ -85,12 +88,13 @@ function filenameFromMetadata(metadata: WorkerMetadata): string {
   return filename;
 }
 
-function runtimeBindings(metadata: WorkerMetadata, kv: KVStore, d1: D1Store, r2: R2Store) {
+function runtimeBindings(metadata: WorkerMetadata, kv: KVStore, d1: D1Store, r2: R2Store, queues: QueueStore) {
   const bindings: Record<string, string> = {};
   const durableObjects: Record<string, string> = {};
   const kvNamespaces: Record<string, string> = {};
   const d1Databases: Record<string, string> = {};
   const r2Buckets: Record<string, string> = {};
+  const queueProducers: Record<string, string> = {};
   for (const binding of metadata.bindings ?? []) {
     if (typeof binding !== "object" || binding === null || typeof binding.name !== "string") {
       throw new InvalidWorkerUpload("Invalid binding");
@@ -118,11 +122,26 @@ function runtimeBindings(metadata: WorkerMetadata, kv: KVStore, d1: D1Store, r2:
         throw new InvalidWorkerUpload("R2 binding needs an existing bucket_name");
       }
       r2Buckets[binding.name] = r2.namespace(binding.bucket_name)!;
+    } else if (binding.type === "queue") {
+      if (typeof binding.queue_name !== "string" || !queues.hasName(binding.queue_name)) {
+        throw new InvalidWorkerUpload("Queue binding needs an existing queue_name");
+      }
+      queueProducers[binding.name] = binding.queue_name;
     } else {
       throw new InvalidWorkerUpload(`Unsupported binding type: ${binding.type}`);
     }
   }
-  return { bindings, durableObjects, kvNamespaces, d1Databases, r2Buckets };
+  return { bindings, durableObjects, kvNamespaces, d1Databases, r2Buckets, queueProducers };
+}
+
+function queueConsumers(name: string, queues: QueueStore) {
+  return Object.fromEntries(queues.consumersForScript(name).map((consumer) => [consumer.queue_name, {
+    maxBatchSize: consumer.settings.batch_size,
+    maxBatchTimeout: consumer.settings.max_wait_time_ms === undefined ? undefined : consumer.settings.max_wait_time_ms / 1000,
+    maxRetries: consumer.settings.max_retries,
+    retryDelay: consumer.settings.retry_delay,
+    deadLetterQueue: consumer.dead_letter_queue || undefined,
+  }]));
 }
 
 /** Owns uploaded scripts and their workerd instances for one Localflare server. */
@@ -130,10 +149,22 @@ export class WorkerStore {
   private readonly scripts = new Map<string, StoredWorker>();
   private readonly durableObjectRoot = mkdtempSync(join(tmpdir(), "localflare-do-"));
 
-  constructor(private readonly kv: KVStore, private readonly d1: D1Store, private readonly r2: R2Store) {}
+  constructor(private readonly kv: KVStore, private readonly d1: D1Store,
+    private readonly r2: R2Store, private readonly queues: QueueStore) {}
+
+  async refreshQueueConsumers(name: string) {
+    const worker = this.scripts.get(name);
+    if (!worker) return;
+    worker.options = { ...worker.options, queueConsumers: queueConsumers(name, this.queues) };
+    await worker.runtime.setOptions(worker.options);
+  }
 
   get(name: string) {
     return this.scripts.get(name);
+  }
+
+  usesQueue(queueName: string) {
+    return [...this.scripts.values()].some((worker) => worker.producerQueues.includes(queueName));
   }
 
   setSubdomain(name: string, settings: { enabled: boolean; previews_enabled: boolean }) {
@@ -155,13 +186,17 @@ export class WorkerStore {
     const content = await file.text();
     const directory = await mkdtemp(join(tmpdir(), "localflare-worker-"));
     let runtime: Miniflare | undefined;
+    let options: ConstructorParameters<typeof Miniflare>[0] | undefined;
+    let producerQueues: string[] = [];
 
     try {
       await writeFile(join(directory, filename), content);
-      const bindings = runtimeBindings(metadata, this.kv, this.d1, this.r2);
+      const bindings = runtimeBindings(metadata, this.kv, this.d1, this.r2, this.queues);
+      producerQueues = Object.values(bindings.queueProducers);
       const common = {
         modulesRoot: directory,
         ...bindings,
+        queueConsumers: queueConsumers(name, this.queues),
         kvPersist: this.kv.persistPath,
         d1Persist: this.d1.persistPath,
         r2Persist: this.r2.persistPath,
@@ -172,9 +207,10 @@ export class WorkerStore {
         compatibilityFlags: metadata.compatibility_flags,
         cf: false,
       };
-      runtime = metadata.body_part
-        ? new Miniflare({ ...common, scriptPath: join(directory, filename) })
-        : new Miniflare({ ...common, modules: [{ type: "ESModule", path: join(directory, filename) }] });
+      options = metadata.body_part
+        ? { ...common, scriptPath: join(directory, filename) }
+        : { ...common, modules: [{ type: "ESModule", path: join(directory, filename) }] };
+      runtime = new Miniflare(options);
       // Startup is eager so an invalid Worker cannot replace a working deployment.
       await runtime.ready;
     } catch (error) {
@@ -191,6 +227,8 @@ export class WorkerStore {
       throw error;
     }
 
+    if (!runtime || !options) throw new Error("Worker runtime did not initialize");
+
     const previous = this.scripts.get(name);
     const now = new Date().toISOString();
     const script = {
@@ -206,6 +244,8 @@ export class WorkerStore {
       content,
       directory,
       runtime,
+      options,
+      producerQueues,
       script,
       subdomain: previous?.subdomain ?? { enabled: false, previews_enabled: false },
     });

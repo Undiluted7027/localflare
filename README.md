@@ -1,6 +1,6 @@
 # Localflare
 
-Localflare is becoming a headless local Cloudflare API emulator. **Checkpoints 1–8 are implemented.** Real clients can reach its identity API, deploy a Worker, and manage KV, D1, R2, zones, rulesets, and DNS without a Cloudflare account.
+Localflare is becoming a headless local Cloudflare API emulator. **Checkpoints 1–9 are implemented.** Real clients can reach its identity API, deploy a Worker, and manage KV, D1, R2, Queues, zones, rulesets, and DNS without a Cloudflare account.
 
 ## Run
 
@@ -66,6 +66,11 @@ CLOUDFLARE_API_TOKEN=localflare-fake-token \
 CLOUDFLARE_ACCOUNT_ID=00000000000000000000000000000001 \
   ./node_modules/.bin/wrangler r2 bucket create my-local-bucket
 
+CLOUDFLARE_API_BASE_URL=http://127.0.0.1:8788/client/v4 \
+CLOUDFLARE_API_TOKEN=localflare-fake-token \
+CLOUDFLARE_ACCOUNT_ID=00000000000000000000000000000001 \
+  ./node_modules/.bin/wrangler queues create my-local-queue
+
 curl http://127.0.0.1:8788/client/v4/zones \
   -H 'Content-Type: application/json' \
   -d '{"account":{"id":"00000000000000000000000000000001"},"name":"example.test","type":"full"}'
@@ -99,7 +104,9 @@ The purge endpoint accepts purge everything, URL files, tags, hosts, or prefixes
 
 Checkpoint 8 serves R2 bucket create/list/get/delete under `/accounts/:id/r2/buckets` and a path-style S3 subset on the same port. S3 clients should use `http://127.0.0.1:8788` as the endpoint, region `auto`, path-style addressing, and any nonempty access key and secret. The verified S3 operations are ListBuckets, CreateBucket, DeleteBucket, ListObjectsV2, PutObject, GetObject, HeadObject, and DeleteObject. Objects are stored in Miniflare R2, and a deployed Worker's `r2_bucket` binding shares that data. Bucket deletion rejects nonempty buckets. Localflare accepts signed requests but does not validate SigV4 signatures. Multipart uploads, copy, tagging, presigned URL validation, virtual-hosted addressing, and the broader S3 protocol are not implemented; object request bodies are limited to 10 MiB.
 
-The account identity is fixed for now. Worker scripts, Durable Object state, KV state, D1 databases, R2 buckets and objects, zones, rulesets, and DNS records are held for the life of the server and removed when it stops. Request bodies are limited to 10 MiB. Text and secret text bindings, local Durable Object bindings, KV, D1, and R2 bindings, and initial `new_sqlite_classes` migrations are supported. Durable Object rename, delete, transfer, and cross Worker bindings are not implemented. Other services belong to later checkpoints in [POC.md](./POC.md).
+Checkpoint 9 serves queue create/list/get/delete under `/accounts/:id/queues` and Worker consumer create/list/get/delete under `/accounts/:id/queues/:queue_id/consumers`. Wrangler `queues create` and the official TypeScript SDK have been verified against these routes. A deployed Worker can publish through a `queue` binding and consume messages through its `queue()` handler when producer and consumer run in the same Miniflare instance. Registering or removing a consumer updates that running Worker. Queue deletion is rejected while it has consumers or a deployed Worker producer binding. Separate Workers currently run in separate Miniflare instances, so messages are not delivered between them. Initial queue settings are stored but do not control delivery. HTTP pull consumers, message management endpoints, queue settings updates, and cross Worker delivery are not implemented.
+
+The account identity is fixed for now. Worker scripts, Durable Object state, KV state, D1 databases, R2 buckets and objects, queue configuration, zones, rulesets, and DNS records are held for the life of the server and removed when it stops. Request bodies are limited to 10 MiB. Text and secret text bindings, local Durable Object bindings, KV, D1, R2, and Queue producer bindings, and initial `new_sqlite_classes` migrations are supported. Durable Object rename, delete, transfer, and cross Worker bindings are not implemented. See [POC.md](./POC.md) for the original checkpoint plan.
 
 ## Verify
 
@@ -109,7 +116,7 @@ npm test
 npm run test:compat
 ```
 
-The compatibility suite launches the pinned Wrangler binary, uses the official `cloudflare` TypeScript SDK and AWS S3 SDK, and runs Terraform with the real Cloudflare provider. It deploys and redeploys Workers, checks Durable Object state across redeploy, runs Wrangler KV, D1, and R2 commands, verifies SDK operations, proves deployed Workers share KV, D1, and R2 state with the management API, and applies then destroys Terraform zones, a ruleset, and a DNS record. Terraform must be installed separately. `terraform init` downloads the pinned provider when it is not cached. The suite starts Localflare on an ephemeral loopback port and supplies that port through each client's base URL override.
+The compatibility suite launches the pinned Wrangler binary, uses the official `cloudflare` TypeScript SDK and AWS S3 SDK, and runs Terraform with the real Cloudflare provider. It deploys and redeploys Workers, checks Durable Object state across redeploy, runs Wrangler KV, D1, R2, and Queues commands, verifies SDK operations, proves deployed Workers share KV, D1, and R2 state with the management API, checks same Worker Queue delivery, and applies then destroys Terraform zones, a ruleset, and a DNS record. Terraform must be installed separately. `terraform init` downloads the pinned provider when it is not cached. The suite starts Localflare on an ephemeral loopback port and supplies that port through each client's base URL override.
 
 The Terraform fixture uses a synthetic 40 character token because the provider checks token format before making HTTP requests. No real credential is used.
 

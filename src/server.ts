@@ -9,6 +9,7 @@ import { DNSStore, InvalidDNSRecord } from "./dns.js";
 import { acknowledgePurge, InvalidCachePurge } from "./cache.js";
 import { R2Store, validBucketName } from "./r2.js";
 import { handleS3 } from "./s3.js";
+import { QueueStore, InvalidQueue } from "./queues.js";
 
 export const account = {
   id: "00000000000000000000000000000001",
@@ -583,6 +584,70 @@ async function handleR2(request: IncomingMessage, response: ServerResponse, r2: 
   } else reply(response, 404, null);
 }
 
+async function handleQueues(request: IncomingMessage, response: ServerResponse, queues: QueueStore,
+  workers: WorkerStore, route: string, url: URL) {
+  const method = request.method;
+  if (route === "queues") {
+    if (method === "POST") {
+      const created = queues.create(await readJson(request));
+      if (!created) reply(response, 409, null, { code: 10021, message: "Queue name already exists" });
+      else reply(response, 200, created);
+    } else if (method === "GET") {
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const perPage = Number(url.searchParams.get("per_page") ?? 100);
+      if (!Number.isInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > 1000) {
+        throw new InvalidQueue("Invalid queue pagination");
+      }
+      const all = queues.list(url.searchParams.get("name") ?? undefined);
+      const result = all.slice((page - 1) * perPage, page * perPage);
+      reply(response, 200, result, { resultInfo: {
+        page, per_page: perPage, count: result.length, total_count: all.length,
+        total_pages: Math.ceil(all.length / perPage),
+      } });
+    } else reply(response, 404, null);
+    return;
+  }
+  const match = /^queues\/([^/]+)(?:\/consumers(?:\/([^/]+))?)?$/.exec(route);
+  if (!match) { reply(response, 404, null); return; }
+  const queueId = match[1]!;
+  const queue = queues.get(queueId);
+  if (!queue) { reply(response, 404, null, { code: 10021, message: "Queue not found" }); return; }
+  const consumerId = match[2];
+  if (route.endsWith("/consumers")) {
+    if (method === "GET") reply(response, 200, queues.listConsumers(queueId));
+    else if (method === "POST") {
+      const consumer = queues.createConsumer(queueId, await readJson(request));
+      if (consumer) await workers.refreshQueueConsumers(consumer.script_name);
+      reply(response, 200, consumer);
+    }
+    else reply(response, 404, null);
+    return;
+  }
+  if (consumerId) {
+    if (method === "GET") {
+      const consumer = queues.getConsumer(queueId, consumerId);
+      reply(response, consumer ? 200 : 404, consumer ?? null);
+    } else if (method === "DELETE") {
+      const existing = queues.getConsumer(queueId, consumerId);
+      const deleted = queues.deleteConsumer(queueId, consumerId);
+      if (deleted && existing) await workers.refreshQueueConsumers(existing.script_name);
+      reply(response, deleted ? 200 : 404, deleted ? { success: true } : null);
+    } else reply(response, 404, null);
+    return;
+  }
+  if (method === "GET") reply(response, 200, queue);
+  else if (method === "DELETE") {
+    if (workers.usesQueue(queue.queue_name)) {
+      reply(response, 409, null, { code: 10021, message: "Remove Worker queue bindings before deleting the queue" });
+      return;
+    }
+    const deleted = queues.delete(queueId);
+    if (deleted === "has-consumers") {
+      reply(response, 409, null, { code: 10021, message: "Remove queue consumers before deleting the queue" });
+    } else reply(response, 200, { success: true });
+  } else reply(response, 404, null);
+}
+
 function sendScript(response: ServerResponse, content: string) {
   response.writeHead(200, { "content-type": "application/javascript; charset=utf-8" });
   response.end(content);
@@ -625,7 +690,7 @@ async function dispatchWorker(request: IncomingMessage, response: ServerResponse
 }
 
 async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore,
-  d1: D1Store, zones: ZoneStore, rulesets: RulesetStore, dns: DNSStore, r2: R2Store) {
+  d1: D1Store, zones: ZoneStore, rulesets: RulesetStore, dns: DNSStore, r2: R2Store, queues: QueueStore) {
   const url = new URL(request.url ?? "/", "http://localhost");
   const { pathname } = url;
   const method = request.method;
@@ -736,6 +801,10 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
     await handleR2(request, response, r2, route.slice("r2/".length), url);
     return;
   }
+  if (route === "queues" || route.startsWith("queues/")) {
+    await handleQueues(request, response, queues, workers, route, url);
+    return;
+  }
   if (!route.startsWith("workers/")) {
     reply(response, 404, null);
     return;
@@ -843,11 +912,12 @@ export function createLocalflareServer() {
   const rulesets = new RulesetStore();
   const dns = new DNSStore();
   const r2 = new R2Store();
-  const workers = new WorkerStore(kv, d1, r2);
+  const queues = new QueueStore();
+  const workers = new WorkerStore(kv, d1, r2, queues);
   const server = createServer((request, response) => {
-    void handle(request, response, workers, kv, d1, zones, rulesets, dns, r2).catch((error: unknown) => {
+    void handle(request, response, workers, kv, d1, zones, rulesets, dns, r2, queues).catch((error: unknown) => {
       if (error instanceof InvalidWorkerUpload || error instanceof InvalidRuleset ||
-          error instanceof InvalidDNSRecord || error instanceof InvalidCachePurge) {
+          error instanceof InvalidDNSRecord || error instanceof InvalidCachePurge || error instanceof InvalidQueue) {
         reply(response, 400, null, { code: 10021, message: error.message });
       } else {
         console.error(error);

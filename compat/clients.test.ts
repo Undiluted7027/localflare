@@ -315,6 +315,67 @@ test("real S3 SDK creates and deletes an R2 bucket", async () => {
   assert.ok(!(await s3.send(new ListBucketsCommand({}))).Buckets?.some((item) => item.Name === bucket));
 });
 
+test("real Wrangler and Cloudflare SDK manage a queue and Worker consumer", async () => {
+  const name = "compat-queue";
+  const wrangler = resolve("node_modules/.bin/wrangler");
+  const env = {
+    ...process.env,
+    CLOUDFLARE_API_BASE_URL: baseURL,
+    CLOUDFLARE_API_TOKEN: "localflare-fake-token",
+    CLOUDFLARE_ACCOUNT_ID: account.id,
+    WRANGLER_SEND_METRICS: "false",
+  };
+  const created = await run(wrangler, ["queues", "create", name], { env, timeout: 30_000 });
+  assert.match(created.stdout, /compat-queue/);
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const page = await client.queues.list({ account_id: account.id });
+  const queue = page.result.find((item) => item.queue_name === name);
+  assert.ok(queue?.queue_id);
+  assert.equal((await client.queues.get(queue.queue_id, { account_id: account.id })).queue_name, name);
+  const namespace = await client.kv.namespaces.create({ account_id: account.id, title: "queue-state" });
+  const directory = await mkdtemp(join(tmpdir(), "localflare-queue-worker-"));
+  try {
+    await writeFile(join(directory, "wrangler.jsonc"), JSON.stringify({
+      name: "queue-consumer",
+      main: resolve("compat/workers/queue.js"),
+      compatibility_date: "2025-07-18",
+      kv_namespaces: [{ binding: "STATE", id: namespace.id }],
+      queues: { producers: [{ binding: "QUEUE", queue: name }] },
+    }));
+    const deployed = await run(wrangler, [
+      "deploy", "--config", join(directory, "wrangler.jsonc"), "--no-autoconfig",
+    ], { env, timeout: 30_000 });
+    assert.match(deployed.stdout, /Deployed queue-consumer triggers/);
+    const consumer = await client.queues.consumers.create(queue.queue_id, {
+      account_id: account.id, script_name: "queue-consumer", type: "worker",
+      settings: { batch_size: 2, max_retries: 1 },
+    });
+    assert.ok(consumer.consumer_id);
+    const retrieved = await client.queues.consumers.get(consumer.consumer_id, {
+      account_id: account.id, queue_id: queue.queue_id,
+    });
+    assert.equal(retrieved.type, "worker");
+    if (retrieved.type === "worker") assert.equal(retrieved.script_name, "queue-consumer");
+    const consumers = await client.queues.consumers.list(queue.queue_id, { account_id: account.id });
+    assert.deepEqual(consumers.result.map((item) => item.consumer_id), [consumer.consumer_id]);
+    const invocationURL = `${baseURL.replace("/client/v4", "")}/__localflare/workers/queue-consumer/`;
+    assert.equal(await (await fetch(invocationURL, { method: "POST", body: "from queue" })).text(), "queued");
+    let received = "pending";
+    for (let attempt = 0; attempt < 30 && received === "pending"; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      received = await (await fetch(invocationURL)).text();
+    }
+    assert.equal(received, "from queue");
+    await client.queues.consumers.delete(consumer.consumer_id, { account_id: account.id, queue_id: queue.queue_id });
+    await client.workers.scripts.delete("queue-consumer", { account_id: account.id });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+  await client.kv.namespaces.delete(namespace.id, { account_id: account.id });
+  await client.queues.delete(queue.queue_id, { account_id: account.id });
+  assert.ok(!(await client.queues.list({ account_id: account.id })).result.some((item) => item.queue_id === queue.queue_id));
+});
+
 test("official TypeScript SDK verifies a fake token and lists the local account", async () => {
   const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
   const verification = await client.user.tokens.verify();
