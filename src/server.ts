@@ -4,6 +4,7 @@ import { WorkerStore, InvalidWorkerUpload } from "./workers.js";
 import { KVStore } from "./kv.js";
 import { D1Store, type D1Query, type SqlParam } from "./d1.js";
 import { ZoneStore, normalizeZoneName, type SettingId, type ZoneType } from "./zones.js";
+import { RulesetStore, InvalidRuleset } from "./rulesets.js";
 
 export const account = {
   id: "00000000000000000000000000000001",
@@ -481,9 +482,27 @@ function sendScript(response: ServerResponse, content: string) {
   response.end(content);
 }
 
-async function dispatchWorker(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, name: string, path: string) {
+async function dispatchWorker(request: IncomingMessage, response: ServerResponse, workers: WorkerStore,
+  zones: ZoneStore, rulesets: RulesetStore, name: string, path: string) {
+  const hostname = request.headers.host?.split(":")[0]?.toLowerCase();
+  const zone = hostname ? zones.list()
+    .filter((item) => hostname === item.name || hostname.endsWith(`.${item.name}`))
+    .sort((a, b) => b.name.length - a.name.length)[0] : undefined;
+  const requested = new URL(path, "http://worker.localflare.internal");
+  const evaluation = zone && rulesets.evaluate(zone.id, zone.name, hostname!, request.method ?? "GET", requested.pathname, requested.search.slice(1));
+  if (evaluation?.kind === "block") {
+    response.writeHead(evaluation.status, { "content-type": evaluation.contentType });
+    response.end(evaluation.body);
+    return;
+  }
+  if (evaluation?.kind === "redirect") {
+    response.writeHead(evaluation.status, { location: evaluation.location });
+    response.end();
+    return;
+  }
+  const effectivePath = evaluation?.kind === "pass" ? `${evaluation.path}${requested.search}` : path;
   const body = request.method === "GET" || request.method === "HEAD" ? undefined : await readBody(request);
-  const workerRequest = new Request(`http://worker.localflare.internal${path}`, {
+  const workerRequest = new Request(`http://worker.localflare.internal${effectivePath}`, {
     method: request.method,
     headers: request.headers as HeadersInit,
     body: body ? new Uint8Array(body) : undefined,
@@ -499,14 +518,15 @@ async function dispatchWorker(request: IncomingMessage, response: ServerResponse
   response.end(Buffer.from(await workerResponse.arrayBuffer()));
 }
 
-async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore, d1: D1Store, zones: ZoneStore) {
+async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore,
+  d1: D1Store, zones: ZoneStore, rulesets: RulesetStore) {
   const url = new URL(request.url ?? "/", "http://localhost");
   const { pathname } = url;
   const method = request.method;
 
   const localWorker = /^\/__localflare\/workers\/([^/]+)(\/.*)?$/.exec(pathname);
   if (localWorker) {
-    await dispatchWorker(request, response, workers, localWorker[1]!, `${localWorker[2] ?? "/"}${url.search}`);
+    await dispatchWorker(request, response, workers, zones, rulesets, localWorker[1]!, `${localWorker[2] ?? "/"}${url.search}`);
     return;
   }
 
@@ -532,7 +552,37 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
     }
   }
 
+  const rulesetPath = /^\/client\/v4\/zones\/([^/]+)\/rulesets(?:\/([^/]+))?$/.exec(pathname);
+  if (rulesetPath) {
+    const zoneId = rulesetPath[1]!;
+    if (!zones.get(zoneId)) {
+      reply(response, 404, null, { code: 9109, message: "Zone not found" });
+      return;
+    }
+    const id = rulesetPath[2];
+    if (!id) {
+      if (method === "GET") reply(response, 200, rulesets.list(zoneId));
+      else if (method === "POST") reply(response, 200, rulesets.create(zoneId, await readJson(request)));
+      else reply(response, 404, null);
+      return;
+    }
+    const existing = rulesets.get(zoneId, id);
+    if (!existing) {
+      reply(response, 404, null, { code: 10021, message: "Ruleset not found" });
+      return;
+    }
+    if (method === "GET") reply(response, 200, existing);
+    else if (method === "PUT") reply(response, 200, rulesets.update(zoneId, id, await readJson(request)));
+    else if (method === "DELETE") { rulesets.delete(zoneId, id); reply(response, 200, null); }
+    else reply(response, 404, null);
+    return;
+  }
+
   if (pathname === "/client/v4/zones" || pathname.startsWith("/client/v4/zones/")) {
+    if (method === "DELETE") {
+      const zoneId = /^\/client\/v4\/zones\/([^/]+)$/.exec(pathname)?.[1];
+      if (zoneId) rulesets.deleteZone(zoneId);
+    }
     await handleZones(request, response, zones, url);
     return;
   }
@@ -655,10 +705,11 @@ export function createLocalflareServer() {
   const kv = new KVStore();
   const d1 = new D1Store();
   const zones = new ZoneStore(account);
+  const rulesets = new RulesetStore();
   const workers = new WorkerStore(kv, d1);
   const server = createServer((request, response) => {
-    void handle(request, response, workers, kv, d1, zones).catch((error: unknown) => {
-      if (error instanceof InvalidWorkerUpload) {
+    void handle(request, response, workers, kv, d1, zones, rulesets).catch((error: unknown) => {
+      if (error instanceof InvalidWorkerUpload || error instanceof InvalidRuleset) {
         reply(response, 400, null, { code: 10021, message: error.message });
       } else {
         console.error(error);

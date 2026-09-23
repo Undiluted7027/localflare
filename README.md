@@ -1,6 +1,6 @@
 # Localflare
 
-Localflare is becoming a headless local Cloudflare API emulator. **Checkpoints 1–5 are implemented.** Real clients can reach its identity API, deploy a Worker, and manage KV, D1, and zones without a Cloudflare account.
+Localflare is becoming a headless local Cloudflare API emulator. **Checkpoints 1–6 are implemented.** Real clients can reach its identity API, deploy a Worker, and manage KV, D1, zones, and rulesets without a Cloudflare account.
 
 ## Run
 
@@ -78,7 +78,17 @@ Checkpoint 4 serves D1 database create/list/get/update/delete and `POST /account
 
 Checkpoint 5 serves zone create/list/get/edit/delete and zone settings list/get/edit under `/zones`. Zone IDs are stable for the server lifetime and will be used by zone-scoped services in later checkpoints. New zones remain `pending` and have no real nameservers or DNS activation. Settings currently support `always_use_https`, `ssl`, `security_level`, and `min_tls_version`; their values are stored but do not change Worker traffic. The official TypeScript SDK and the real Terraform `cloudflare_zone` resource are verified against these routes.
 
-The account identity is fixed for now. Worker scripts, Durable Object state, KV state, D1 databases, and zones are held for the life of the server and removed when it stops. Request bodies are limited to 10 MiB. Text and secret text bindings, local Durable Object bindings, KV and D1 bindings, and initial `new_sqlite_classes` migrations are supported. Durable Object rename, delete, transfer, and cross Worker bindings are not implemented. Other services belong to later checkpoints in [POC.md](./POC.md).
+Checkpoint 6 serves zone ruleset create/list/get/update/delete at `/zones/:zone_id/rulesets`. A real `cloudflare_ruleset` Terraform resource and the official TypeScript SDK are verified against these routes. The local evaluator applies zone entry point rulesets in `http_request_dynamic_redirect`, `http_request_transform`, then `http_request_firewall_custom` order. It supports static redirects, static path rewrites, block, and log. Expressions support `true`, `false`, parentheses, `and`/`or`/`not`, `starts_with`, and `eq`/`ne`/`contains` on `http.request.uri.path`, `http.request.method`, `http.host`, and `cf.zone.name`. Unsupported expressions and actions are rejected when written.
+
+Rules are evaluated for requests to `/__localflare/workers/:name/*` when the HTTP `Host` header matches a local zone or one of its subdomains. For example, after creating a zone named `example.test` and a matching ruleset:
+
+```sh
+curl -H 'Host: example.test' http://127.0.0.1:8788/__localflare/workers/hello/example
+```
+
+Account rulesets, phase entry point convenience routes, individual rule and version routes, dynamic redirect/rewrite expressions, custom ruleset execution, and broader Rules language fields are not yet implemented. Custom rulesets can be stored, but only zone entry point rulesets affect local requests. Rule evaluation is limited to the local Worker invocation path; Localflare does not route arbitrary zone traffic or activate DNS.
+
+The account identity is fixed for now. Worker scripts, Durable Object state, KV state, D1 databases, zones, and rulesets are held for the life of the server and removed when it stops. Request bodies are limited to 10 MiB. Text and secret text bindings, local Durable Object bindings, KV and D1 bindings, and initial `new_sqlite_classes` migrations are supported. Durable Object rename, delete, transfer, and cross Worker bindings are not implemented. Other services belong to later checkpoints in [POC.md](./POC.md).
 
 ## Verify
 
@@ -88,7 +98,7 @@ npm test
 npm run test:compat
 ```
 
-The compatibility suite launches the pinned Wrangler binary, uses the official `cloudflare` TypeScript SDK, and runs Terraform with the real Cloudflare provider. It deploys and redeploys Workers, checks Durable Object state across redeploy, runs Wrangler KV and D1 commands, verifies SDK operations, proves deployed Workers share KV and D1 state with the management API, and applies then destroys a Terraform zone. Terraform must be installed separately. `terraform init` downloads the pinned provider when it is not cached. The suite starts Localflare on an ephemeral loopback port and supplies that port through each client's base URL override.
+The compatibility suite launches the pinned Wrangler binary, uses the official `cloudflare` TypeScript SDK, and runs Terraform with the real Cloudflare provider. It deploys and redeploys Workers, checks Durable Object state across redeploy, runs Wrangler KV and D1 commands, verifies SDK operations, proves deployed Workers share KV and D1 state with the management API, and applies then destroys Terraform zones and a ruleset. Terraform must be installed separately. `terraform init` downloads the pinned provider when it is not cached. The suite starts Localflare on an ephemeral loopback port and supplies that port through each client's base URL override.
 
 The Terraform fixture uses a synthetic 40 character token because the provider checks token format before making HTTP requests. No real credential is used.
 

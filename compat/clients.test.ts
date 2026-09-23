@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { after, before, test } from "node:test";
 import type { AddressInfo } from "node:net";
+import { request as httpRequest } from "node:http";
 import Cloudflare from "cloudflare";
 import { account, createLocalflareServer } from "../src/server.js";
 
@@ -282,6 +283,41 @@ test("official TypeScript SDK creates a zone and edits its settings", async () =
   assert.ok(!(await client.zones.list({ name: "compat.example" })).result.some((item) => item.id === zone.id));
 });
 
+test("official TypeScript SDK manages a zone URL rewrite ruleset", async () => {
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const zone = await client.zones.create({
+    account: { id: account.id }, name: "sdk-rules.example", type: "full",
+  });
+  try {
+    const created = await client.rulesets.create({
+      zone_id: zone.id, name: "Rewrite paths", kind: "zone", phase: "http_request_transform",
+      rules: [{
+        action: "rewrite", expression: 'http.request.uri.path eq "/before"',
+        action_parameters: { uri: { path: { value: "/after" } } },
+      }],
+    });
+    assert.ok(typeof created === "object" && created !== null && "id" in created && typeof created.id === "string");
+    const id = created.id;
+    const listed = await client.rulesets.list({ zone_id: zone.id });
+    assert.ok(listed.result.some((item) => item.id === id));
+    const read = await client.rulesets.get(id, { zone_id: zone.id });
+    assert.equal(read.rules[0]?.action, "rewrite");
+    const updated = await client.rulesets.update(id, {
+      zone_id: zone.id, description: "Updated through the SDK", rules: [{
+        action: "rewrite", expression: 'http.request.uri.path eq "/new"',
+        action_parameters: { uri: { path: { value: "/after" } } },
+      }],
+    });
+    assert.ok(typeof updated === "object" && updated !== null && "version" in updated);
+    assert.equal(updated.version, "2");
+    assert.equal((await client.rulesets.get(id, { zone_id: zone.id })).description, "Updated through the SDK");
+    await client.rulesets.delete(id, { zone_id: zone.id });
+    assert.ok(!(await client.rulesets.list({ zone_id: zone.id })).result.some((item) => item.id === id));
+  } finally {
+    await client.zones.delete({ zone_id: zone.id });
+  }
+});
+
 test("real Terraform provider reads accounts through base_url", async () => {
   const directory = await mkdtemp(join(tmpdir(), "localflare-terraform-"));
   try {
@@ -318,6 +354,54 @@ test("real Terraform provider creates and destroys a zone", async () => {
       cwd: directory, env, timeout: 60_000,
     });
     assert.ok(!(await client.zones.list({ name: "terraform.example" })).result.some((zone) => zone.id === id));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("real Terraform provider applies and updates a zone firewall ruleset", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "localflare-terraform-ruleset-"));
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const env = { ...process.env, TF_IN_AUTOMATION: "1", TF_INPUT: "0" };
+  const fixture = await readFile(new URL("./terraform/ruleset.tf", import.meta.url), "utf8");
+  const mainPath = join(directory, "main.tf");
+  const invoke = (path: string) => new Promise<number>((resolveStatus, reject) => {
+    const request = httpRequest(`${baseURL.replace("/client/v4", "")}/__localflare/workers/no-worker${path}`, {
+      headers: { host: "ruleset.example" },
+    }, (response) => {
+      response.resume();
+      response.on("end", () => resolveStatus(response.statusCode ?? 0));
+    });
+    request.on("error", reject);
+    request.end();
+  });
+  try {
+    await writeFile(mainPath, fixture.replaceAll("LOCALFLARE_BASE_URL", baseURL).replace("BLOCK_PATH", "first"));
+    await run("terraform", ["init", "-no-color"], { cwd: directory, env, timeout: 180_000 });
+    const apply = () => run("terraform", ["apply", "-auto-approve", "-no-color"], {
+      cwd: directory, env, timeout: 60_000,
+    });
+    await apply();
+    const zoneId = (await run("terraform", ["output", "-raw", "zone_id"], { cwd: directory, env })).stdout.trim();
+    const rulesetId = (await run("terraform", ["output", "-raw", "ruleset_id"], { cwd: directory, env })).stdout.trim();
+    assert.match(rulesetId, /^[a-f0-9]{32}$/);
+    const ruleset = await client.rulesets.get(rulesetId, { zone_id: zoneId });
+    assert.equal(ruleset.phase, "http_request_firewall_custom");
+    assert.equal(ruleset.rules[0]?.action, "block");
+    assert.equal(ruleset.rules[0]?.expression, '(http.request.uri.path eq "/first")');
+    const listed = await client.rulesets.list({ zone_id: zoneId });
+    assert.ok(listed.result.some((item) => item.id === rulesetId));
+    assert.equal(await invoke("/first"), 403);
+    assert.equal(await invoke("/second"), 404);
+
+    await writeFile(mainPath, fixture.replaceAll("LOCALFLARE_BASE_URL", baseURL).replace("BLOCK_PATH", "second"));
+    await apply();
+    assert.equal(await invoke("/first"), 404);
+    assert.equal(await invoke("/second"), 403);
+    await run("terraform", ["destroy", "-auto-approve", "-no-color"], {
+      cwd: directory, env, timeout: 60_000,
+    });
+    assert.equal(await invoke("/second"), 404);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
