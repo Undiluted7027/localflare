@@ -1,6 +1,6 @@
 # Localflare
 
-Localflare is becoming a headless local Cloudflare API emulator. **Checkpoints 1–4 are implemented.** Real clients can reach its identity API, deploy a Worker, and manage KV and D1 without a Cloudflare account.
+Localflare is becoming a headless local Cloudflare API emulator. **Checkpoints 1–5 are implemented.** Real clients can reach its identity API, deploy a Worker, and manage KV, D1, and zones without a Cloudflare account.
 
 ## Run
 
@@ -60,6 +60,14 @@ CLOUDFLARE_API_TOKEN=localflare-fake-token \
 CLOUDFLARE_ACCOUNT_ID=00000000000000000000000000000001 \
   ./node_modules/.bin/wrangler d1 execute my-local-db \
   --remote --command 'SELECT 1 AS answer' --json
+
+curl http://127.0.0.1:8788/client/v4/zones \
+  -H 'Content-Type: application/json' \
+  -d '{"account":{"id":"00000000000000000000000000000001"},"name":"example.test","type":"full"}'
+
+# Use the zone ID returned above.
+curl http://127.0.0.1:8788/client/v4/zones/YOUR_ZONE_ID/settings/always_use_https \
+  -X PATCH -H 'Content-Type: application/json' -d '{"value":"on"}'
 ```
 
 Checkpoint 1 serves `GET /user/tokens/verify`, `GET /user`, `GET /accounts`, and `GET /memberships` beneath `/client/v4`. Checkpoint 2 serves Workers script upload, download, list, and delete routes. Wrangler deploy uses a few additional service, version, and subdomain routes. The API accepts both module and service Worker syntax. Uploaded scripts run in workerd through Miniflare, and the local invocation path is `/__localflare/workers/:name/*` on the same port. The `workers.dev` URL printed by Wrangler is a compatibility response; use the local invocation path to call the Worker.
@@ -68,7 +76,9 @@ Checkpoint 3 serves namespace create/list/get/rename/delete and individual key p
 
 Checkpoint 4 serves D1 database create/list/get/update/delete and `POST /accounts/:id/d1/database/:uuid/query`. SQL runs in Miniflare's SQLite-backed D1, including parameterized queries and multiple semicolon-separated statements. Workers with a `d1` binding and the management API see the same database. Wrangler `d1 execute` must use `--remote`; its default `--local` mode uses Wrangler's own private database. The `--file` import flow, `/raw`, export, time travel, and replication are not implemented. `read_replication.mode` is stored as configuration only; no replicas are created.
 
-The account identity is fixed for now. Worker scripts, Durable Object state, KV state, and D1 databases are held for the life of the server and removed when it stops. Request bodies are limited to 10 MiB. Text and secret text bindings, local Durable Object bindings, KV and D1 bindings, and initial `new_sqlite_classes` migrations are supported. Durable Object rename, delete, transfer, and cross Worker bindings are not implemented. Other services belong to later checkpoints in [POC.md](./POC.md).
+Checkpoint 5 serves zone create/list/get/edit/delete and zone settings list/get/edit under `/zones`. Zone IDs are stable for the server lifetime and will be used by zone-scoped services in later checkpoints. New zones remain `pending` and have no real nameservers or DNS activation. Settings currently support `always_use_https`, `ssl`, `security_level`, and `min_tls_version`; their values are stored but do not change Worker traffic. The official TypeScript SDK and the real Terraform `cloudflare_zone` resource are verified against these routes.
+
+The account identity is fixed for now. Worker scripts, Durable Object state, KV state, D1 databases, and zones are held for the life of the server and removed when it stops. Request bodies are limited to 10 MiB. Text and secret text bindings, local Durable Object bindings, KV and D1 bindings, and initial `new_sqlite_classes` migrations are supported. Durable Object rename, delete, transfer, and cross Worker bindings are not implemented. Other services belong to later checkpoints in [POC.md](./POC.md).
 
 ## Verify
 
@@ -78,7 +88,7 @@ npm test
 npm run test:compat
 ```
 
-The compatibility suite launches the pinned Wrangler binary, uses the official `cloudflare` TypeScript SDK, and runs Terraform with the real Cloudflare provider. It deploys and redeploys Workers, checks Durable Object state across redeploy, runs Wrangler KV and D1 commands, verifies SDK operations, and proves deployed Workers share KV and D1 state with the management API. Terraform must be installed separately. `terraform init` downloads the pinned provider when it is not cached. The suite starts Localflare on an ephemeral loopback port and supplies that port through each client's base URL override.
+The compatibility suite launches the pinned Wrangler binary, uses the official `cloudflare` TypeScript SDK, and runs Terraform with the real Cloudflare provider. It deploys and redeploys Workers, checks Durable Object state across redeploy, runs Wrangler KV and D1 commands, verifies SDK operations, proves deployed Workers share KV and D1 state with the management API, and applies then destroys a Terraform zone. Terraform must be installed separately. `terraform init` downloads the pinned provider when it is not cached. The suite starts Localflare on an ephemeral loopback port and supplies that port through each client's base URL override.
 
 The Terraform fixture uses a synthetic 40 character token because the provider checks token format before making HTTP requests. No real credential is used.
 

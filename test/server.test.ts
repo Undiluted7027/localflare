@@ -150,3 +150,47 @@ test("D1 statement splitting preserves semicolons in strings and comments", () =
   ]);
   assert.deepEqual(splitSql("SELECT 1; -- trailing comment;\n /* more; comments */"), ["SELECT 1"]);
 });
+
+test("zones normalize names and reject partial settings updates", async () => {
+  const zonesURL = `${baseURL}/zones`;
+  const create = (name: string) => fetch(zonesURL, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ account: { id: account.id }, name, type: "full" }),
+  });
+  assert.equal((await create("bad..name")).status, 400);
+  const created = await create("ExAmPlE.test");
+  assert.equal(created.status, 200);
+  const zone = (await created.json() as { result: { id: string; name: string } }).result;
+  assert.equal(zone.name, "example.test");
+  assert.equal((await create("example.test")).status, 400);
+
+  const listed = await (await fetch(`${zonesURL}?name=example.test`)).json() as {
+    result: Array<{ id: string }>;
+    result_info: { total_count: number };
+  };
+  assert.deepEqual(listed.result.map((item) => item.id), [zone.id]);
+  assert.equal(listed.result_info.total_count, 1);
+
+  const settingsURL = `${zonesURL}/${zone.id}/settings`;
+  const initial = await (await fetch(settingsURL)).json() as { result: Array<{ id: string; value: string }> };
+  assert.equal(initial.result.length, 4);
+  const patch = (items: Array<{ id: string; value: string }>) => fetch(settingsURL, {
+    method: "PATCH", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ items }),
+  });
+  assert.equal((await patch([
+    { id: "always_use_https", value: "on" },
+    { id: "ssl", value: "impossible" },
+  ])).status, 400);
+  const unchanged = await (await fetch(`${settingsURL}/always_use_https`)).json() as { result: { value: string } };
+  assert.equal(unchanged.result.value, "off");
+  assert.equal((await patch([
+    { id: "always_use_https", value: "on" },
+    { id: "ssl", value: "strict" },
+  ])).status, 200);
+  const edited = await (await fetch(`${settingsURL}/ssl`)).json() as { result: { value: string } };
+  assert.equal(edited.result.value, "strict");
+
+  assert.equal((await fetch(`${zonesURL}/${zone.id}`, { method: "DELETE" })).status, 200);
+  assert.equal((await fetch(settingsURL)).status, 404);
+});

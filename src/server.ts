@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { WorkerStore, InvalidWorkerUpload } from "./workers.js";
 import { KVStore } from "./kv.js";
 import { D1Store, type D1Query, type SqlParam } from "./d1.js";
+import { ZoneStore, normalizeZoneName, type SettingId, type ZoneType } from "./zones.js";
 
 export const account = {
   id: "00000000000000000000000000000001",
@@ -353,6 +354,128 @@ async function handleD1(request: IncomingMessage, response: ServerResponse, d1: 
   reply(response, 404, null);
 }
 
+function zoneType(value: unknown): value is ZoneType {
+  return value === "full" || value === "partial" || value === "secondary" || value === "internal";
+}
+
+async function handleZones(request: IncomingMessage, response: ServerResponse, zones: ZoneStore, url: URL) {
+  const method = request.method;
+  const { pathname } = url;
+  if (pathname === "/client/v4/zones") {
+    if (method === "POST") {
+      const body = await readJson(request);
+      if (typeof body !== "object" || body === null || !("account" in body) ||
+          typeof body.account !== "object" || body.account === null ||
+          !("name" in body) || typeof body.name !== "string") {
+        throw new InvalidWorkerUpload("Zone needs account and name");
+      }
+      if ("id" in body.account && body.account.id !== account.id) {
+        reply(response, 400, null, { code: 10021, message: "Unknown account" });
+        return;
+      }
+      const name = normalizeZoneName(body.name);
+      const type = "type" in body ? body.type : "full";
+      if (!name || !zoneType(type)) throw new InvalidWorkerUpload("Invalid zone name or type");
+      const created = zones.create(name, type);
+      if (created) reply(response, 200, created);
+      else reply(response, 400, null, { code: 1061, message: "Zone already exists" });
+      return;
+    }
+    if (method === "GET") {
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const perPage = Number(url.searchParams.get("per_page") ?? 20);
+      if (!Number.isInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 5 || perPage > 50) {
+        throw new InvalidWorkerUpload("Invalid zone pagination");
+      }
+      const accountId = url.searchParams.get("account[id]") ?? url.searchParams.get("account.id");
+      let result = zones.list().filter((zone) =>
+        (!accountId || zone.account.id === accountId) &&
+        (!url.searchParams.has("name") || zone.name === url.searchParams.get("name")) &&
+        (!url.searchParams.has("status") || zone.status === url.searchParams.get("status")) &&
+        (url.searchParams.has("type")
+          ? url.searchParams.get("type")?.split(",").includes(zone.type)
+          : zone.type !== "internal"));
+      result.sort((a, b) => a.name.localeCompare(b.name));
+      if (url.searchParams.get("direction") === "desc") result.reverse();
+      const total = result.length;
+      result = result.slice((page - 1) * perPage, page * perPage);
+      reply(response, 200, result, { resultInfo: {
+        page, per_page: perPage, count: result.length,
+        total_count: total, total_pages: Math.ceil(total / perPage),
+      } });
+      return;
+    }
+  }
+
+  const match = /^\/client\/v4\/zones\/([^/]+)(?:\/settings(?:\/([^/]+))?)?$/.exec(pathname);
+  if (!match) {
+    reply(response, 404, null);
+    return;
+  }
+  const id = match[1]!;
+  const zone = zones.get(id);
+  if (!zone) {
+    reply(response, 404, null, { code: 9109, message: "Zone not found" });
+    return;
+  }
+  const settingId = match[2];
+  const isSettings = pathname.includes("/settings");
+  if (!isSettings) {
+    if (method === "GET") reply(response, 200, zone);
+    else if (method === "DELETE") {
+      zones.delete(id);
+      reply(response, 200, { id });
+    } else if (method === "PATCH") {
+      const body = await readJson(request);
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        throw new InvalidWorkerUpload("Invalid zone edit");
+      }
+      const keys = Object.keys(body);
+      if (keys.length === 1 && "paused" in body && typeof body.paused === "boolean") {
+        reply(response, 200, zones.edit(id, { paused: body.paused }));
+      } else if (keys.length === 1 && "type" in body && zoneType(body.type)) {
+        reply(response, 200, zones.edit(id, { type: body.type }));
+      } else throw new InvalidWorkerUpload("Zone edit needs one valid property");
+    } else reply(response, 404, null);
+    return;
+  }
+  if (settingId === undefined) {
+    if (method === "GET") reply(response, 200, zones.listSettings(id));
+    else if (method === "PATCH") {
+      const body = await readJson(request);
+      if (typeof body !== "object" || body === null || !("items" in body) || !Array.isArray(body.items) ||
+          body.items.length === 0) {
+        throw new InvalidWorkerUpload("Invalid zone settings items");
+      }
+      const changes: Array<{ id: SettingId; value: string }> = [];
+      const items: unknown[] = body.items;
+      for (const item of items) {
+        if (typeof item !== "object" || item === null || !("id" in item) || !("value" in item) ||
+            typeof item.id !== "string" || typeof item.value !== "string" ||
+            !zones.acceptsSetting(item.id, item.value)) {
+          throw new InvalidWorkerUpload("Invalid zone settings items");
+        }
+        changes.push({ id: item.id, value: item.value });
+      }
+      reply(response, 200, zones.editSettings(id, changes));
+    } else reply(response, 404, null);
+    return;
+  }
+  if (!zones.getSetting(id, settingId)) {
+    reply(response, 404, null, { code: 10021, message: "Zone setting not found" });
+    return;
+  }
+  if (method === "GET") reply(response, 200, zones.getSetting(id, settingId));
+  else if (method === "PATCH") {
+    const body = await readJson(request);
+    const value = typeof body === "object" && body !== null && "value" in body ? body.value : undefined;
+    if (typeof value !== "string" || !zones.acceptsSetting(settingId, value)) {
+      throw new InvalidWorkerUpload("Invalid zone setting value");
+    }
+    reply(response, 200, zones.editSettings(id, [{ id: settingId, value }])?.[0]);
+  } else reply(response, 404, null);
+}
+
 function sendScript(response: ServerResponse, content: string) {
   response.writeHead(200, { "content-type": "application/javascript; charset=utf-8" });
   response.end(content);
@@ -376,7 +499,7 @@ async function dispatchWorker(request: IncomingMessage, response: ServerResponse
   response.end(Buffer.from(await workerResponse.arrayBuffer()));
 }
 
-async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore, d1: D1Store) {
+async function handle(request: IncomingMessage, response: ServerResponse, workers: WorkerStore, kv: KVStore, d1: D1Store, zones: ZoneStore) {
   const url = new URL(request.url ?? "/", "http://localhost");
   const { pathname } = url;
   const method = request.method;
@@ -407,6 +530,11 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
         }], { resultInfo: pageInfo });
         return;
     }
+  }
+
+  if (pathname === "/client/v4/zones" || pathname.startsWith("/client/v4/zones/")) {
+    await handleZones(request, response, zones, url);
+    return;
   }
 
   const accountPath = /^\/client\/v4\/accounts\/([^/]+)\/(.*)$/.exec(pathname);
@@ -526,9 +654,10 @@ async function handle(request: IncomingMessage, response: ServerResponse, worker
 export function createLocalflareServer() {
   const kv = new KVStore();
   const d1 = new D1Store();
+  const zones = new ZoneStore(account);
   const workers = new WorkerStore(kv, d1);
   const server = createServer((request, response) => {
-    void handle(request, response, workers, kv, d1).catch((error: unknown) => {
+    void handle(request, response, workers, kv, d1, zones).catch((error: unknown) => {
       if (error instanceof InvalidWorkerUpload) {
         reply(response, 400, null, { code: 10021, message: error.message });
       } else {

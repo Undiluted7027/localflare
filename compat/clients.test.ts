@@ -250,6 +250,38 @@ test("official TypeScript SDK verifies a fake token and lists the local account"
   assert.equal(page.result[0]?.name, account.name);
 });
 
+test("official TypeScript SDK creates a zone and edits its settings", async () => {
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  const zone = await client.zones.create({
+    account: { id: account.id }, name: "compat.example", type: "full",
+  });
+  assert.match(zone.id, /^[a-f0-9]{32}$/);
+  assert.equal(zone.status, "pending");
+  assert.equal(zone.account.id, account.id);
+
+  const listed = await client.zones.list({ name: "compat.example", account: { id: account.id } });
+  assert.deepEqual(listed.result.map((item) => item.id), [zone.id]);
+  assert.equal((await client.zones.get({ zone_id: zone.id })).name, zone.name);
+
+  const defaultSetting = await client.zones.settings.get("always_use_https", { zone_id: zone.id });
+  assert.ok("value" in defaultSetting);
+  assert.equal(defaultSetting.value, "off");
+  const editedSetting = await client.zones.settings.edit("always_use_https", {
+    zone_id: zone.id, value: "on",
+  });
+  assert.ok("value" in editedSetting);
+  assert.equal(editedSetting.value, "on");
+  const persistedSetting = await client.zones.settings.get("always_use_https", { zone_id: zone.id });
+  assert.ok("value" in persistedSetting);
+  assert.equal(persistedSetting.value, "on");
+
+  const editedZone = await client.zones.edit({ zone_id: zone.id, paused: true });
+  assert.equal(editedZone.paused, true);
+  assert.equal((await client.zones.get({ zone_id: zone.id })).paused, true);
+  assert.deepEqual(await client.zones.delete({ zone_id: zone.id }), { id: zone.id });
+  assert.ok(!(await client.zones.list({ name: "compat.example" })).result.some((item) => item.id === zone.id));
+});
+
 test("real Terraform provider reads accounts through base_url", async () => {
   const directory = await mkdtemp(join(tmpdir(), "localflare-terraform-"));
   try {
@@ -262,6 +294,30 @@ test("real Terraform provider reads accounts through base_url", async () => {
       cwd: directory, env, timeout: 30_000,
     });
     assert.equal(stdout.trim(), account.id);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("real Terraform provider creates and destroys a zone", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "localflare-terraform-zone-"));
+  const client = new Cloudflare({ apiToken: "localflare-fake-token", baseURL });
+  try {
+    const fixture = await readFile(new URL("./terraform/zone.tf", import.meta.url), "utf8");
+    await writeFile(join(directory, "main.tf"), fixture.replaceAll("LOCALFLARE_BASE_URL", baseURL));
+    const env = { ...process.env, TF_IN_AUTOMATION: "1", TF_INPUT: "0" };
+    await run("terraform", ["init", "-no-color"], { cwd: directory, env, timeout: 180_000 });
+    await run("terraform", ["apply", "-auto-approve", "-no-color"], { cwd: directory, env, timeout: 60_000 });
+    const { stdout } = await run("terraform", ["output", "-raw", "zone_id"], {
+      cwd: directory, env, timeout: 30_000,
+    });
+    const id = stdout.trim();
+    assert.match(id, /^[a-f0-9]{32}$/);
+    assert.equal((await client.zones.get({ zone_id: id })).name, "terraform.example");
+    await run("terraform", ["destroy", "-auto-approve", "-no-color"], {
+      cwd: directory, env, timeout: 60_000,
+    });
+    assert.ok(!(await client.zones.list({ name: "terraform.example" })).result.some((zone) => zone.id === id));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
